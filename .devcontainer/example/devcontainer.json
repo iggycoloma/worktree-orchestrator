@@ -1,0 +1,65 @@
+{
+  // NOTE: This file uses JSON with comments, which is a VS Code-specific extension.
+  // Standard JSON parsers may not support comments.
+
+  "name": "Example Devcontainer with Dotfiles",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+
+  // NOTE: The "dotfiles" property here is VS Code-specific and not part of the official
+  // devcontainer specification. The official approach is to configure dotfiles in your
+  // VS Code User Settings: "dotfiles.repository" and "dotfiles.installCommand".
+  // This property works in VS Code but may not work with other devcontainer tools.
+  "dotfiles": {
+    "repository": "yourusername/.dotfiles",
+    "installCommand": "install.sh"
+  },
+
+  // Named volumes for persistent Claude Code and Codex configurations
+  // These volumes persist across container rebuilds
+  "mounts": [
+    // Persist Claude Code configuration across rebuilds
+    "source=${localWorkspaceFolderBasename}-claude-volume,target=/home/vscode/.claude,type=volume",
+
+    // Persist Codex configuration across rebuilds (if using)
+    "source=${localWorkspaceFolderBasename}-codex-volume,target=/home/vscode/.codex,type=volume",
+
+    // Optional: Persist shell history
+    "source=${localWorkspaceFolderBasename}-history-volume,target=/home/vscode/.history,type=volume"
+  ],
+
+  // VS Code extensions to install
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "github.copilot"
+      ],
+      "settings": {
+        // VS Code settings
+        "terminal.integrated.defaultProfile.linux": "zsh"
+      }
+    }
+  },
+
+  // Features to install (alternative to manual package installation)
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  // Post-create command to run after container is created
+  // Useful for project-specific setup
+  "postCreateCommand": "echo 'Container ready!'",
+
+  // Use 'forwardPorts' to make ports available locally
+  "forwardPorts": [3000, 8080],
+
+  // Run arguments for docker
+  "runArgs": [
+    "--name=${localWorkspaceFolderBasename}-devcontainer"
+  ],
+
+  // User to run as (should match the user in your container)
+  "remoteUser": "vscode"
+}
