@@ -14,17 +14,12 @@
     "installCommand": "install.sh"
   },
 
-  // Named volumes for persistent Claude Code and Codex configurations
-  // These volumes persist across container rebuilds
+  // Single state volume for persistent CLI tool data (credentials, history,
+  // sessions). The dotfiles installer detects this mount and wires ~/.claude
+  // and ~/.codex as directory symlinks into the volume. Configs are refreshed
+  // from dotfiles on every boot; state files persist across rebuilds.
   "mounts": [
-    // Persist Claude Code configuration across rebuilds
-    "source=${localWorkspaceFolderBasename}-claude-volume,target=/home/vscode/.claude,type=volume",
-
-    // Persist Codex configuration across rebuilds (if using)
-    "source=${localWorkspaceFolderBasename}-codex-volume,target=/home/vscode/.codex,type=volume",
-
-    // Optional: Persist shell history
-    "source=${localWorkspaceFolderBasename}-history-volume,target=/home/vscode/.history,type=volume"
+    "source=${localWorkspaceFolderBasename}-state,target=/home/vscode/.devcontainer-state,type=volume"
   ],
 
   // VS Code extensions to install
