@@ -55,12 +55,6 @@
     "--name=${localWorkspaceFolderBasename}-devcontainer"
   ],
 
-  // Forward Pushover credentials from host into container
-  "remoteEnv": {
-    "PUSHOVER_TOKEN": "${localEnv:PUSHOVER_TOKEN}",
-    "PUSHOVER_USER": "${localEnv:PUSHOVER_USER}"
-  },
-
   // User to run as (should match the user in your container)
   "remoteUser": "vscode"
 }
