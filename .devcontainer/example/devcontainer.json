@@ -14,19 +14,18 @@
     "installCommand": "install.sh"
   },
 
-  // Optional: Named volume for CLI state persistence. Without this, the
-  // dotfiles installer automatically uses workspace-local storage (local
-  // devcontainers) or Codespaces persistent share. The volume approach
-  // keeps state outside the project tree but requires this config line.
-  // "mounts": [
-  //   "source=${localWorkspaceFolderBasename}-state,target=/home/vscode/.dotfiles-state,type=volume"
-  // ],
+  // Named volume for persistent CLI state (auth tokens, history, sessions).
+  // In Codespaces this is automatic; for local devcontainers add this mount.
+  // Without it, state is ephemeral and lost on container rebuild.
+  "mounts": [
+    "source=${devcontainerId}-state,target=/home/vscode/.dotfiles-state,type=volume"
+  ],
 
   // Installation toggles (set in remoteEnv to disable features):
   //   DOTFILES_NO_AI_TOOLS=1    -- skip Claude Code, Codex, ast-grep, difftastic
   //   DOTFILES_NO_ATUIN=1       -- skip atuin shell history
   //   DOTFILES_NO_GIT_HOOKS=1   -- skip global git hooks (conventional commits, gitleaks)
-  //   DOTFILES_NO_STATE_PERSISTENCE=1 -- skip state persistence (no workspace-local or Codespaces tier)
+  //   DOTFILES_NO_STATE_PERSISTENCE=1 -- skip state persistence (no volume or Codespaces tier)
 
   // VS Code extensions to install
   "customizations": {
