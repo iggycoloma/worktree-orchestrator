@@ -144,12 +144,10 @@ The installation will:
 
 If you see broken symlinks in `~/.claude/` inside a container, the dotfiles installation didn't detect the devcontainer environment properly.
 
-**Solution**: Check that `REMOTE_CONTAINERS` or `CODESPACES` environment variables are set. You can manually trigger merge mode by running:
+**Solution**: Check that `REMOTE_CONTAINERS` or `CODESPACES` environment variables are set. You can manually re-run the installer:
 
 ```bash
-source ~/.dotfiles/bootstrap/detect.sh
-source ~/.dotfiles/bootstrap/merge-configs.sh
-setup_claude_merge ~/.dotfiles/claude-code
+~/.dotfiles/install.sh
 ```
 
 ### Settings Not Persisting Across Rebuilds

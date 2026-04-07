@@ -26,6 +26,7 @@
   //   DOTFILES_NO_ATUIN=1       -- skip atuin shell history
   //   DOTFILES_NO_GIT_HOOKS=1   -- skip global git hooks (conventional commits, gitleaks)
   //   DOTFILES_NO_STATE_PERSISTENCE=1 -- skip state persistence (no volume or Codespaces tier)
+  //   DOTFILES_NO_SSH_SIGNING=1      -- skip SSH commit signing auto-detection
 
   // VS Code extensions to install
   "customizations": {
