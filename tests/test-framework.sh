@@ -10,6 +10,7 @@ TEST_CURRENT_SUITE=""
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+# shellcheck disable=SC2034  # sourced by test files
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
@@ -23,6 +24,7 @@ TEST_TEMP_DIR=""
 #
 
 test_suite() {
+    # shellcheck disable=SC2034  # informational, used for diagnostics
     TEST_CURRENT_SUITE="$1"
     echo -e "\n${CYAN}==== Test Suite: $1 ====${NC}\n"
 }
@@ -122,7 +124,8 @@ assert_symlink() {
         return 1
     fi
 
-    local actual_target=$(readlink "$link")
+    local actual_target
+    actual_target=$(readlink "$link")
     if [[ "$actual_target" == "$expected_target" ]]; then
         test_pass "$message"
         return 0
