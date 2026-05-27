@@ -1,223 +1,56 @@
-# Devcontainer Configuration Example
+# Devcontainer Example
 
-This directory contains an example devcontainer configuration that works with the dotfiles repository's environment-aware setup strategy.
-
-## Overview
-
-When using devcontainers with named volumes for `.claude` and `.codex` directories, the dotfiles installation automatically switches from **symlink mode** (used on host) to **copy-merge mode** to avoid broken symlinks.
-
-## How It Works
-
-### On Your Host Machine
-```bash
-~/.claude/settings.json -> ~/.dotfiles/claude-code/settings.json (symlink)
-~/.claude/hooks/        -> ~/.dotfiles/claude-code/hooks/      (symlink)
-```
-
-### In a Devcontainer
-```bash
-~/.claude/                    # Named Docker volume (persists across rebuilds)
-  ├── settings.json           # Copied from dotfiles, preserved if exists
-  ├── hooks/                  # Merged from dotfiles, updated on reinstall
-  ├── agents/                 # Merged from dotfiles, updated on reinstall
-  ├── commands/               # Merged from dotfiles, updated on reinstall
-  └── .dotfiles-version       # Tracks when dotfiles were installed
-```
-
-## Setup Instructions
-
-### 1. Copy Configuration to Your Project
-
-Copy `devcontainer.json` to your project's `.devcontainer/` directory:
+`devcontainer.json` in this directory is a reference template. Copy it into
+your own project's `.devcontainer/` to get the dotfiles environment with
+persistent state across container rebuilds.
 
 ```bash
 mkdir -p .devcontainer
 cp ~/.dotfiles/.devcontainer/example/devcontainer.json .devcontainer/
 ```
 
-### 2. Update the Configuration
+Then:
 
-Edit `.devcontainer/devcontainer.json`:
+1. Replace `"repository": "yourusername/.dotfiles"` with your fork.
+2. (Recommended) configure dotfiles repo + install command in VS Code User
+   Settings instead of inside `devcontainer.json` -- the in-file `dotfiles`
+   property is a VS Code-only extension, not part of the spec.
+3. (Recommended) run `bin/dc-audit.sh --strict` against your final
+   `devcontainer.json` to catch risky mounts, capabilities, and
+   security-opt entries.
 
-- Replace `"repository": "yourusername/.dotfiles"` with your actual dotfiles repo
-- Adjust the base image if needed
-- Add any project-specific VS Code extensions
-- Customize mount points or volume names
+## What this gives you
 
-### 3. Configure Dotfiles Integration
+The example template includes:
 
-**Official Method (Recommended)**: Configure in VS Code User Settings:
+- **One shared state volume** (`source=${devcontainerId}-state,target=/home/vscode/.dotfiles-state,type=volume`)
+  -- persists Claude Code, Codex, Copilot CLI, and shell history across
+  rebuilds. See [`../../docs/architecture.md#state-persistence`](../../docs/architecture.md#state-persistence)
+  for the tiered persistence model.
+- **All dotfiles toggles documented** as commented-out `remoteEnv` entries
+  you can flip on as needed. See
+  [`../../docs/customization.md#installation-toggles`](../../docs/customization.md#installation-toggles)
+  for the full list.
+- **Baseline hardening** -- `--security-opt=no-new-privileges` in
+  `runArgs` so the container can't acquire new capabilities via setuid
+  binaries. Run `bin/dc-audit.sh` to lint the rest of the spec.
 
-```json
-{
-  "dotfiles.repository": "yourusername/.dotfiles",
-  "dotfiles.installCommand": "install.sh"
-}
-```
+See `docs/sandbox.md` for the full security model.
 
-**Alternative (VS Code-Specific)**: The example `devcontainer.json` includes a `dotfiles` property, which is a VS Code-specific extension not part of the official devcontainer specification. This works in VS Code but may not work with other devcontainer tools. The User Settings method above is more portable.
-
-### 4. Open in Devcontainer
-
-1. Open your project in VS Code
-2. Press `Cmd+Shift+P` (Mac) or `Ctrl+Shift+P` (Windows/Linux)
-3. Select "Dev Containers: Reopen in Container"
-4. Wait for container to build and dotfiles to install
-
-## Named Volumes Explained
-
-### Why Named Volumes?
-
-Named volumes persist data across container rebuilds, which is essential for:
-
-- Preserving Claude Code settings and customizations
-- Keeping shell history
-- Maintaining project-specific overrides
-
-### Volume Naming Convention
-
-The example uses `${localWorkspaceFolderBasename}-claude-volume`, which creates unique volumes per project:
-
-- Project `my-app` → Volume `my-app-claude-volume`
-- Project `api-server` → Volume `api-server-claude-volume`
-
-This allows different projects to have different Claude Code configurations.
-
-## Project-Specific Overrides
-
-### Adding Project-Specific Claude Settings
-
-The merge strategy preserves existing files, so you can add project-specific overrides:
-
-1. **After first container build**, modify files in `~/.claude/` inside the container
-2. These changes persist in the named volume
-3. Dotfiles will NOT overwrite them on subsequent rebuilds
-
-### Example: Project-Specific Settings
-
-Create a project-specific settings.json:
+## Updating dotfiles in a running container
 
 ```bash
-# Inside the devcontainer
-cat > ~/.claude/settings.json <<'EOF'
-{
-  "hooks": {
-    "PreToolUse": [
-      "~/.claude/hooks/project-specific-validation.sh"
-    ]
-  }
-}
-EOF
+cd ~/.dotfiles && git pull && ./install.sh
 ```
 
-This file will persist across rebuilds and won't be overwritten by dotfiles.
+`install.sh` is re-runnable. Configs refresh from the dotfiles repo; state
+(auth tokens, sessions, shell history) in the volume is preserved.
 
-### Force-Updated Files
+## Reset to fresh configuration
 
-Some files are ALWAYS updated from dotfiles:
-
-- `agents/*.md` - Shared agent definitions
-- `commands/*.md` - Shared slash commands
-- `hooks/*.sh` - Hook scripts (but settings.json controls which are used)
-
-This ensures you get the latest shared tools while preserving customizations.
-
-## Updating Dotfiles in a Running Container
-
-To update your dotfiles in a running container:
+To wipe the persisted state (sign out of all CLIs, lose shell history):
 
 ```bash
-# Inside the devcontainer
-cd ~/.dotfiles
-git pull
-./install.sh
+docker volume rm <devcontainerId>-state
+# Then rebuild the container.
 ```
-
-The installation will:
-- Update force-updated files (agents, commands, hooks)
-- Preserve your existing settings.json
-- Show what was updated vs. skipped
-
-## Troubleshooting
-
-### Symlinks Appear Broken in Container
-
-If you see broken symlinks in `~/.claude/` inside a container, the dotfiles installation didn't detect the devcontainer environment properly.
-
-**Solution**: Check that `REMOTE_CONTAINERS` or `CODESPACES` environment variables are set. You can manually re-run the installer:
-
-```bash
-~/.dotfiles/install.sh
-```
-
-### Settings Not Persisting Across Rebuilds
-
-Make sure the volume mount is configured correctly in `devcontainer.json`:
-
-```json
-"mounts": [
-  "source=${localWorkspaceFolderBasename}-claude-volume,target=/home/vscode/.claude,type=volume"
-]
-```
-
-Verify the volume exists:
-```bash
-docker volume ls | grep claude
-```
-
-### Want to Reset Configuration
-
-To reset to fresh dotfiles configuration:
-
-```bash
-# Remove the volume
-docker volume rm your-project-claude-volume
-
-# Rebuild the container
-# Configuration will be freshly copied from dotfiles
-```
-
-## Best Practices
-
-1. **Use named volumes** for configuration directories that should persist
-2. **Keep base config in dotfiles**, project-specific in the volume
-3. **Don't commit** `.devcontainer/devcontainer.json` if it contains personal settings
-4. **Use `.gitignore`** for devcontainer files if they're user-specific:
-   ```
-   .devcontainer/
-   ```
-5. **Document project requirements** in project README if specific Claude settings are needed
-
-## Alternative Approaches
-
-### Bind Mount Dotfiles (Not Recommended for Volumes)
-
-You could mount dotfiles directly:
-
-```json
-"mounts": [
-  "source=${localEnv:HOME}/.dotfiles,target=/home/vscode/.dotfiles,type=bind"
-]
-```
-
-**Pros**: Changes to dotfiles immediately reflected in container
-**Cons**: Doesn't work in Codespaces, couples container to host filesystem
-
-### Host Volume Mount for .claude (Not Recommended)
-
-You could mount `.claude` from host:
-
-```json
-"mounts": [
-  "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind"
-]
-```
-
-**Pros**: Same config on host and container
-**Cons**: Symlinks break, no project isolation, doesn't work in Codespaces
-
-## Additional Resources
-
-- [VS Code Dev Containers Documentation](https://code.visualstudio.com/docs/devcontainers/containers)
-- [VS Code Dotfiles Support](https://code.visualstudio.com/docs/devcontainers/tips-and-tricks#_dotfiles)
-- [Docker Volumes Documentation](https://docs.docker.com/storage/volumes/)

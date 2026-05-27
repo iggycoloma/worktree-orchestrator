@@ -27,6 +27,7 @@
   //   DOTFILES_NO_GIT_HOOKS=1   -- skip global git hooks (conventional commits, gitleaks)
   //   DOTFILES_NO_STATE_PERSISTENCE=1 -- skip state persistence (no volume or Codespaces tier)
   //   DOTFILES_NO_SSH_SIGNING=1      -- skip SSH commit signing auto-detection
+  //   DOTFILES_INSTALL_UNATTENDED=1  -- deploy unattended harness to ~/.unattended/
 
   // VS Code extensions to install
   "customizations": {
@@ -56,9 +57,10 @@
   // Use 'forwardPorts' to make ports available locally
   "forwardPorts": [3000, 8080],
 
-  // Run arguments for docker
+  // Run arguments for docker.
   "runArgs": [
-    "--name=${localWorkspaceFolderBasename}-devcontainer"
+    "--name=${localWorkspaceFolderBasename}-devcontainer",
+    "--security-opt=no-new-privileges"
   ],
 
   // User to run as (should match the user in your container)
