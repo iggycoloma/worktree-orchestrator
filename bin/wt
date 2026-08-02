@@ -1,0 +1,704 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# wt -- worktree operations for the agentic dev environment.
+#
+# Two layouts, detected automatically (docs/agentic-worktree-dev-environment.md,
+# planning/2026-08-02-agentic-worktree-system.md):
+#
+#   orchestration mode   <root>/repo.git (bare) + local/ + state/ + main/ + wt/<slug>
+#   clone mode           ordinary clone; worktrees at <parent>/<repo>-worktrees/<leaf>
+#
+# Machine-readable output (paths) goes to stdout; all logging goes to stderr,
+# so wrappers can `cd "$(wt add x)"`. Bash 3.2 compatible; single file for
+# now -- split into bootstrap/lib/wt/ when the devcontainer/compose commands
+# land (Phase 5).
+
+usage() {
+    cat >&2 <<'HELP'
+Usage: wt <command> [args]
+
+  init <url> <dir>      create an orchestration dir (bare clone + local/ state/ main/ wt/)
+  add <name> [base]     create a worktree (+ provision local files in orchestration mode)
+  list                  list worktrees for the current project
+  path <name>           print the worktree's path
+  sync <name|--all>     refresh local/shared into a worktree, 'main', or all (templates untouched)
+  diff-local <name>     show drift between local/shared and a worktree's copies
+  container-up <name>   start the worktree's dev container (host only)
+  exec <name> -- <cmd>  run a command in the worktree's dev container (host only)
+  remove <name> [--branch]  remove a worktree + its containers (refuses dirty)
+  prune                 clean up stale worktree administrative entries
+  doctor                check layout, git version, pointers, and tooling
+HELP
+    exit 2
+}
+
+log()  { printf 'wt: %s\n' "$*" >&2; }
+die()  { printf 'wt: error: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- layout ----
+
+# Walk up from $PWD looking for an orchestration root (a dir containing a
+# bare repo.git). Prints the root or nothing.
+find_orchestration_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/repo.git" ]] \
+            && [[ "$(git --git-dir="$dir/repo.git" rev-parse --is-bare-repository 2>/dev/null)" == "true" ]]; then
+            printf '%s\n' "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+# In clone mode: print the main worktree root of the enclosing repository.
+find_clone_root() {
+    git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p'
+}
+
+# Sets globals: WT_MODE, WT_GIT_DIR, WT_ROOT (orchestration dir or clone parent).
+detect_mode() {
+    local orch_root
+    if orch_root="$(find_orchestration_root)"; then
+        WT_MODE="orchestration"
+        WT_ROOT="$orch_root"
+        WT_GIT_DIR="$orch_root/repo.git"
+        return 0
+    fi
+    local clone_root
+    clone_root="$(find_clone_root)"
+    [[ -n "$clone_root" ]] || die "not inside a git repository or orchestration directory"
+    WT_MODE="clone"
+    WT_ROOT="$clone_root"
+    WT_GIT_DIR="$clone_root/.git"
+}
+
+# True when $1 is a version >= $2 (sort -V; empty $1 is never enough).
+version_at_least() {
+    local have="$1" want="$2"
+    [[ -n "$have" ]] || return 1
+    [[ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | head -1)" == "$want" ]]
+}
+
+# --relative-paths landed in git 2.48; older git errors on the flag. The
+# packages layer keeps git current (git-core PPA); this guard keeps wt
+# usable when it is not: pointers degrade to absolute, per-worktree
+# containers stop working (doctor flags it), everything else survives.
+# Sets WT_REL_FLAG once and warns once on the degraded path.
+ensure_rel_flag() {
+    [[ -z "${WT_REL_FLAG+x}" ]] || return 0
+    if version_at_least "$(git --version | awk '{print $3}')" "2.48.0"; then
+        WT_REL_FLAG="--relative-paths"
+    else
+        WT_REL_FLAG=""
+        log "warning: git < 2.48 -- creating worktree with an absolute pointer (per-worktree containers need relative paths)"
+    fi
+}
+
+normalize_slug() {
+    printf '%s' "${1:?}" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's/[^a-z0-9._-]\{1,\}/-/g' -e 's/^[-.]*//' -e 's/[-.]*$//' \
+        | cut -c1-48
+}
+
+# Base ref for new branches: origin's default branch, degrading to HEAD.
+# Matches Claude Code's worktree.baseRef=fresh and the former shell function.
+default_base() {
+    local git_dir="$1" base
+    base="$(git --git-dir="$git_dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    if [[ -n "$base" ]] && git --git-dir="$git_dir" rev-parse --verify --quiet "${base}^{commit}" >/dev/null 2>&1; then
+        printf '%s\n' "$base"
+    else
+        printf 'HEAD\n'
+    fi
+}
+
+worktree_dest() {
+    local name="$1" slug
+    slug="$(normalize_slug "${name##*/}")"
+    [[ -n "$slug" ]] || die "name '$name' produced an empty slug"
+    if [[ "$WT_MODE" == "orchestration" ]]; then
+        printf '%s\n' "$WT_ROOT/wt/$slug"
+    else
+        local repo
+        repo="$(basename "$WT_ROOT")"
+        printf '%s\n' "$(dirname "$WT_ROOT")/${repo}-worktrees/$slug"
+    fi
+}
+
+# Resolve an EXISTING worktree by name. Unlike worktree_dest (the creation
+# mapping), this also resolves the stable main/ checkout, which is simply
+# one worktree and gets synced like any other, and accepts an absolute
+# path -- needed for worktrees created outside wt whose directory name is
+# not a slug (the post-checkout hook passes the path for exactly that).
+resolve_worktree() {
+    local name="$1"
+    if [[ "$name" == /* && -d "$name" ]]; then
+        printf '%s\n' "$name"
+    elif [[ "$WT_MODE" == "orchestration" && "$name" == "main" ]]; then
+        printf '%s\n' "$WT_ROOT/main"
+    else
+        worktree_dest "$name"
+    fi
+}
+
+# ---------------------------------------------------------- provisioning ----
+
+# Refuse to copy any local/ file whose destination the project does not
+# gitignore. This is the security invariant: "we intended to ignore secrets"
+# becomes enforced, not hoped.
+validate_local_tree() {
+    # Returns 1 rather than die: the caller owns rollback of the half-made
+    # worktree, and an exit here would skip it.
+    local source_dir="$1" worktree="$2" src rel
+    [[ -d "$source_dir" ]] || return 0
+    while IFS= read -r -d '' src; do
+        rel="${src#"$source_dir"/}"
+        if ! git -C "$worktree" check-ignore -q -- "$rel"; then
+            log "refusing to provision non-ignored local file: $rel (add it to the project's .gitignore)"
+            return 1
+        fi
+    done < <(find "$source_dir" -type f -print0)
+}
+
+provision_local_files() {
+    local root="$1" worktree="$2"
+    local shared="$root/local/shared" template="$root/local/template"
+    [[ -d "$shared" || -d "$template" ]] || return 0
+    validate_local_tree "$shared" "$worktree" || return 1
+    validate_local_tree "$template" "$worktree" || return 1
+    if ! command -v rsync >/dev/null 2>&1; then
+        log "warning: rsync not found; skipping local file provisioning"
+        return 0
+    fi
+    # No --delete: never remove worktree-local ignored state.
+    # --checksum: the quick check (size+mtime, 1s granularity) misses
+    # same-size edits made within a second of the copy; shared/'s contract
+    # is overwrite-on-content-change, so compare content.
+    [[ -d "$shared" ]] && rsync -a --checksum --exclude='.DS_Store' "$shared/" "$worktree/"
+    [[ -d "$template" ]] && rsync -a --ignore-existing --exclude='.DS_Store' "$template/" "$worktree/"
+    return 0
+}
+
+# Lifecycle hooks: user-owned scripts in the orchestration dir, never
+# sourced from the checkout itself (same trust boundary as read_conf).
+# post-add runs once after a new worktree is provisioned; post-sync runs
+# after every re-provision, because derived files (e.g. a generated
+# manifest) go stale when shared env values change. A failing hook keeps
+# the worktree: setup is retryable, secrets validation is not.
+run_hook() {
+    local name="$1" root="$2" worktree="$3"
+    local hook="$root/local/hooks/$name"
+    [[ -x "$hook" ]] || return 0
+    log "running $name hook: $hook"
+    if ! (cd "$worktree" && "$hook" "$worktree"); then
+        log "warning: $name hook failed; continuing (fix and re-run: $hook $worktree)"
+    fi
+}
+
+# ----------------------------------------------------- runtime identity ----
+
+# Minimal key=value reader for the tracked project config. Never sources
+# shell from an untrusted checkout; values are charset-restricted.
+read_conf() {
+    local conf="$1" key="$2" default="$3" val=""
+    if [[ -f "$conf" ]]; then
+        val="$(sed -n "s/^${key}=//p" "$conf" | head -1 | tr -d '"' | tr -d "'")"
+        case "$val" in *[!A-Za-z0-9._/-]*) val="" ;; esac
+    fi
+    printf '%s\n' "${val:-$default}"
+}
+
+project_id() {
+    basename "$WT_ROOT"
+}
+
+# Atomic-mkdir lock: flock is absent on macOS, mkdir is atomic everywhere.
+with_ports_lock() {
+    local lockdir="$1" tries=0
+    until mkdir "$lockdir" 2>/dev/null; do
+        tries=$((tries + 1))
+        [[ "$tries" -lt 50 ]] || return 1
+        sleep 0.1
+    done
+    return 0
+}
+
+# Allocate (or return the already-allocated) port for a slug. Registry is
+# state/ports.tsv: "<slug>\t<port>" per line.
+allocate_port() {
+    local root="$1" slug="$2" conf="$3"
+    local start end registry lockdir existing port
+    start="$(read_conf "$conf" PORT_RANGE_START 3100)"
+    end="$(read_conf "$conf" PORT_RANGE_END 3999)"
+    # The conf is checkout-controlled; a non-numeric or inverted range must
+    # not abort mid-add (set -e turns a bad arithmetic test into an exit).
+    case "$start" in ''|*[!0-9]*) log "warning: invalid PORT_RANGE_START in $conf; using 3100"; start=3100 ;; esac
+    case "$end" in ''|*[!0-9]*) log "warning: invalid PORT_RANGE_END in $conf; using 3999"; end=3999 ;; esac
+    if [[ "$start" -gt "$end" ]]; then
+        log "warning: PORT_RANGE_START > PORT_RANGE_END in $conf; using 3100-3999"
+        start=3100 end=3999
+    fi
+    registry="$root/state/ports.tsv"
+    lockdir="$root/state/ports.lock.d"
+    mkdir -p "$root/state"
+    touch "$registry"
+
+    with_ports_lock "$lockdir" || { log "warning: port registry is locked; skipping allocation"; return 1; }
+
+    existing="$(awk -F'\t' -v s="$slug" '$1 == s { print $2; exit }' "$registry")"
+    if [[ -n "$existing" ]]; then
+        rmdir "$lockdir"
+        printf '%s\n' "$existing"
+        return 0
+    fi
+
+    port="$start"
+    while [[ "$port" -le "$end" ]]; do
+        if ! awk -F'\t' -v p="$port" '$2 == p { found=1 } END { exit found ? 0 : 1 }' "$registry"; then
+            printf '%s\t%s\n' "$slug" "$port" >> "$registry"
+            rmdir "$lockdir"
+            printf '%s\n' "$port"
+            return 0
+        fi
+        port=$((port + 1))
+    done
+    rmdir "$lockdir"
+    log "warning: no free port in $start-$end"
+    return 1
+}
+
+release_port() {
+    local root="$1" slug="$2"
+    local registry="$root/state/ports.tsv" lockdir="$root/state/ports.lock.d" tmp
+    [[ -f "$registry" ]] || return 0
+    with_ports_lock "$lockdir" || return 0
+    tmp="$registry.tmp.$$"
+    awk -F'\t' -v s="$slug" '$1 != s' "$registry" > "$tmp" && mv "$tmp" "$registry"
+    rmdir "$lockdir"
+}
+
+# Generated per-worktree runtime identity. Written only when the project
+# ignores the destination (same invariant as provisioning); skipped with a
+# warning otherwise so add still succeeds. Safe to re-run at sync time:
+# every value is a pure function of slug/project (allocate_port returns
+# the slug's existing port), the file is rewritten only when the content
+# actually changes, and a transient allocation failure never downgrades a
+# file that already carries an APP_PORT.
+write_worktree_env() {
+    local root="$1" worktree="$2" slug="$3"
+    local conf="$worktree/.dev/worktree.conf" pid app_port slug_db envfile content
+    envfile="$worktree/.env.worktree"
+    pid="$(read_conf "$conf" PROJECT_ID "$(project_id)")"
+    if ! git -C "$worktree" check-ignore -q -- .env.worktree; then
+        log "warning: .env.worktree is not gitignored by this project; skipping runtime identity"
+        return 0
+    fi
+    app_port="$(allocate_port "$root" "$slug" "$conf")" || app_port=""
+    if [[ -z "$app_port" ]] && grep -q '^APP_PORT=' "$envfile" 2>/dev/null; then
+        log "warning: port allocation failed; keeping existing $envfile"
+        return 0
+    fi
+    slug_db="$(printf '%s' "$slug" | tr '.-' '__')"
+    content="$(
+        printf '# Generated by wt. Do not commit.\n'
+        printf 'WORKTREE_SLUG=%s\n' "$slug"
+        printf 'COMPOSE_PROJECT_NAME=%s-%s\n' "$pid" "$slug"
+        printf 'DATABASE_NAME=%s_%s\n' "$(printf '%s' "$pid" | tr '.-' '__')" "$slug_db"
+        printf 'CACHE_NAMESPACE=%s\n' "$slug"
+        if [[ -n "$app_port" ]]; then printf 'APP_PORT=%s\n' "$app_port"; fi
+    )"
+    if [[ -f "$envfile" ]] && printf '%s\n' "$content" | cmp -s - "$envfile"; then
+        return 0
+    fi
+    printf '%s\n' "$content" > "$envfile"
+    chmod 600 "$envfile"
+}
+
+# ----------------------------------------------------------- containers ----
+
+require_host_docker() {
+    # /.dockerenv detects Docker only; podman/containerd containers lack it
+    # (bootstrap/detect.sh's is_devcontainer is richer, but wt stays
+    # standalone). Worst case there: devcontainer-CLI absence catches it.
+    [[ ! -f /.dockerenv ]] || die "container commands are host-only: containers never launch containers"
+    command -v devcontainer >/dev/null 2>&1 || die "devcontainer CLI not installed (run install.sh)"
+}
+
+# Shared flags: worktree common-dir mounting (verified to reconstruct the
+# relative layout for both shapes) and teardown labels for wt remove.
+dc_common_flags() {
+    local dest="$1" slug="$2"
+    printf -- '--workspace-folder\n%s\n--mount-git-worktree-common-dir\n--id-label\nwt.project=%s\n--id-label\nwt.slug=%s\n' \
+        "$dest" "$(project_id)" "$slug"
+}
+
+# Personal dotfiles for CLI-launched containers, matching VS Code behavior.
+# Explicit override via WT_DOTFILES_REPOSITORY; falls back to ~/.dotfiles'
+# origin. CLI flags, not devcontainer.json: personal config never belongs
+# in a project's tracked spec.
+dotfiles_repo() {
+    if [[ -n "${WT_DOTFILES_REPOSITORY:-}" ]]; then
+        printf '%s\n' "$WT_DOTFILES_REPOSITORY"
+    elif [[ -n "${DOTFILES_DIR:-}" ]] && git -C "$DOTFILES_DIR" remote get-url origin 2>/dev/null; then
+        : # non-standard checkout location (e.g. /workspaces/.dotfiles)
+    else
+        git -C "$HOME/.dotfiles" remote get-url origin 2>/dev/null || true
+    fi
+}
+
+cmd_container_up() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: wt container-up <name>"
+    detect_mode
+    local dest slug repo
+    dest="$(resolve_worktree "$name")"
+    [[ -d "$dest" ]] || die "no such worktree: $dest"
+    require_host_docker
+    slug="$(basename "$dest")"
+
+    local flags=()
+    while IFS= read -r line; do flags+=("$line"); done < <(dc_common_flags "$dest" "$slug")
+    repo="$(dotfiles_repo)"
+    [[ -n "$repo" ]] && flags+=(--dotfiles-repository "$repo")
+
+    devcontainer up "${flags[@]}"
+}
+
+cmd_exec() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: wt exec <name> -- <command...>"
+    shift
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -gt 0 ]] || die "usage: wt exec <name> -- <command...>"
+    detect_mode
+    local dest slug
+    dest="$(resolve_worktree "$name")"
+    [[ -d "$dest" ]] || die "no such worktree: $dest"
+    require_host_docker
+    slug="$(basename "$dest")"
+
+    local flags=()
+    while IFS= read -r line; do flags+=("$line"); done < <(dc_common_flags "$dest" "$slug")
+
+    # The CLI does not copy host gitconfig (unlike the VS Code extension),
+    # so commits in-container need identity injected from the host.
+    local gname gemail
+    gname="$(git config user.name 2>/dev/null || true)"
+    gemail="$(git config user.email 2>/dev/null || true)"
+    if [[ -n "$gname" && -n "$gemail" ]]; then
+        flags+=(--remote-env "GIT_AUTHOR_NAME=$gname" --remote-env "GIT_AUTHOR_EMAIL=$gemail")
+        flags+=(--remote-env "GIT_COMMITTER_NAME=$gname" --remote-env "GIT_COMMITTER_EMAIL=$gemail")
+    fi
+
+    devcontainer exec "${flags[@]}" "$@"
+}
+
+# Tear down containers labeled for this worktree. Volumes are retained;
+# the devcontainer CLI has no down subcommand, so docker owns teardown.
+teardown_containers() {
+    local slug="$1" ids
+    command -v docker >/dev/null 2>&1 || return 0
+    [[ ! -f /.dockerenv ]] || return 0
+    ids="$(docker ps -aq --filter "label=wt.project=$(project_id)" --filter "label=wt.slug=$slug" 2>/dev/null || true)"
+    if [[ -n "$ids" ]]; then
+        log "removing containers for $slug"
+        # shellcheck disable=SC2086  # ids are newline-separated container ids
+        docker rm -f $ids >/dev/null 2>&1 || log "warning: container teardown failed for $slug"
+    fi
+}
+
+# ------------------------------------------------------------- commands ----
+
+cmd_init() {
+    local url="${1:-}" root="${2:-}"
+    [[ -n "$url" && -n "$root" ]] || die "usage: wt init <remote-url> <project-dir>"
+    [[ ! -e "$root/repo.git" ]] || die "already initialized: $root/repo.git"
+
+    mkdir -p "$root/local/shared" "$root/local/template" "$root/state" "$root/wt"
+    chmod 700 "$root/local"
+
+    # Transactional: a failed clone or main checkout removes repo.git so a
+    # re-run does not hit "already initialized" on a half-built dir. The
+    # scaffolding dirs stay -- they may already hold user-seeded local/.
+    if ! git clone --bare "$url" "$root/repo.git"; then
+        rm -rf "$root/repo.git"
+        die "clone failed; nothing initialized at $root"
+    fi
+    git --git-dir="$root/repo.git" config worktree.useRelativePaths true
+
+    local default_branch
+    default_branch="$(git --git-dir="$root/repo.git" symbolic-ref --short HEAD 2>/dev/null || true)"
+    default_branch="${default_branch:-main}"
+    ensure_rel_flag
+    # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
+    if ! git --git-dir="$root/repo.git" worktree add $WT_REL_FLAG "$root/main" "$default_branch" >&2; then
+        rm -rf "$root/repo.git" "$root/main"
+        die "could not check out '$default_branch' (empty remote?); rolled back -- push an initial commit and re-run"
+    fi
+
+    log "initialized $root (default branch: $default_branch)"
+    printf '%s\n' "$root"
+}
+
+cmd_add() {
+    local name="${1:-}" base="${2:-}"
+    [[ -n "$name" ]] || die "usage: wt add <name> [base]"
+    detect_mode
+    [[ "$WT_MODE" != "orchestration" || "$name" != "main" ]] \
+        || die "'main' is reserved for the stable checkout (use 'wt sync main' to provision it)"
+
+    local dest branch
+    # The name doubles as the branch when it is a legal ref (slashes fine,
+    # e.g. user/CLK-943); otherwise the branch falls back to the slug.
+    if git check-ref-format --branch "$name" >/dev/null 2>&1; then
+        branch="$name"
+    else
+        branch="$(normalize_slug "${name##*/}")"
+    fi
+    dest="$(worktree_dest "$name")"
+    [[ ! -e "$dest" ]] || die "already exists: $dest"
+    mkdir -p "$(dirname "$dest")"
+
+    ensure_rel_flag
+    if git --git-dir="$WT_GIT_DIR" show-ref --verify --quiet "refs/heads/$branch"; then
+        # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
+        git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG "$dest" "$branch" >&2
+    else
+        [[ -n "$base" ]] || base="$(default_base "$WT_GIT_DIR")"
+        # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
+        git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG -b "$branch" "$dest" "$base" >&2
+    fi
+
+    if [[ "$WT_MODE" == "orchestration" ]]; then
+        if ! provision_local_files "$WT_ROOT" "$dest"; then
+            # Roll back: a half-provisioned worktree must not survive a
+            # failed security validation.
+            git --git-dir="$WT_GIT_DIR" worktree remove --force "$dest" >/dev/null 2>&1 || true
+            git --git-dir="$WT_GIT_DIR" branch -D "$branch" >/dev/null 2>&1 || true
+            die "provisioning failed; worktree rolled back"
+        fi
+        write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")"
+        run_hook post-add "$WT_ROOT" "$dest"
+    fi
+
+    log "created $dest (branch: $branch, mode: $WT_MODE)"
+    printf '%s\n' "$dest"
+}
+
+cmd_list() {
+    detect_mode
+    log "mode: $WT_MODE (root: $WT_ROOT)"
+    git --git-dir="$WT_GIT_DIR" worktree list
+}
+
+cmd_path() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: wt path <name>"
+    detect_mode
+    local dest
+    dest="$(resolve_worktree "$name")"
+    [[ -d "$dest" ]] || die "no such worktree: $dest"
+    printf '%s\n' "$dest"
+}
+
+cmd_sync() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: wt sync <name|--all>"
+    detect_mode
+    [[ "$WT_MODE" == "orchestration" ]] || die "sync requires an orchestration dir (clone mode has no local/ source)"
+
+    if [[ "$name" == "--all" ]]; then
+        # Every registered worktree: main/ plus everything under wt/.
+        local wt_path failures=0
+        while IFS= read -r wt_path; do
+            [[ -n "$wt_path" && -d "$wt_path" ]] || continue
+            # worktree list includes the bare repo itself; it has no tree.
+            [[ "$wt_path" != "$WT_GIT_DIR" ]] || continue
+            if provision_local_files "$WT_ROOT" "$wt_path"; then
+                log "synced local/ into $wt_path"
+                write_worktree_env "$WT_ROOT" "$wt_path" "$(basename "$wt_path")"
+                run_hook post-sync "$WT_ROOT" "$wt_path"
+            else
+                log "WARNING: sync failed validation for $wt_path; nothing copied there"
+                failures=$((failures + 1))
+            fi
+        done < <(git --git-dir="$WT_GIT_DIR" worktree list --porcelain | sed -n 's/^worktree //p')
+        [[ "$failures" -eq 0 ]] || die "sync --all: $failures worktree(s) failed validation"
+        return 0
+    fi
+
+    local dest
+    dest="$(resolve_worktree "$name")"
+    [[ -d "$dest" ]] || die "no such worktree: $dest"
+    provision_local_files "$WT_ROOT" "$dest" || die "sync failed validation; nothing copied"
+    log "synced local/ into $dest"
+    write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")"
+    run_hook post-sync "$WT_ROOT" "$dest"
+}
+
+cmd_diff_local() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: wt diff-local <name>"
+    detect_mode
+    [[ "$WT_MODE" == "orchestration" ]] || die "diff-local requires an orchestration dir"
+    local dest shared src rel drift=0
+    dest="$(resolve_worktree "$name")"
+    [[ -d "$dest" ]] || die "no such worktree: $dest"
+    shared="$WT_ROOT/local/shared"
+    [[ -d "$shared" ]] || { log "no local/shared to compare"; return 0; }
+    while IFS= read -r -d '' src; do
+        rel="${src#"$shared"/}"
+        if [[ ! -f "$dest/$rel" ]]; then
+            printf 'missing\t%s\n' "$rel"
+            drift=1
+        elif ! cmp -s "$src" "$dest/$rel"; then
+            printf 'differs\t%s\n' "$rel"
+            drift=1
+        fi
+    done < <(find "$shared" -type f -print0)
+    if [[ "$drift" -eq 0 ]]; then
+        log "no drift: worktree matches local/shared"
+    else
+        log "drift found; run 'wt sync $name' to refresh (worktree copies are overwritten)"
+        return 1
+    fi
+}
+
+cmd_remove() {
+    local name="" delete_branch=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --branch) delete_branch=1 ;;
+            -*) die "unknown option: $arg" ;;
+            *) [[ -n "$name" ]] && die "usage: wt remove <name> [--branch]"; name="$arg" ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "usage: wt remove <name> [--branch]"
+    detect_mode
+    [[ "$WT_MODE" != "orchestration" || "$name" != "main" ]] \
+        || die "refusing to remove the stable main/ checkout"
+    local dest branch slug
+    dest="$(worktree_dest "$name")"
+    [[ -d "$dest" ]] || die "no such worktree: $dest"
+    slug="$(basename "$dest")"
+
+    branch="$(git -C "$dest" symbolic-ref --short HEAD 2>/dev/null || true)"
+
+    # Refuse to destroy uncommitted or untracked work.
+    git -C "$dest" diff --quiet || die "worktree has unstaged changes: $dest"
+    git -C "$dest" diff --cached --quiet || die "worktree has staged changes: $dest"
+    [[ -z "$(git -C "$dest" ls-files --others --exclude-standard)" ]] \
+        || die "worktree has untracked files: $dest"
+
+    teardown_containers "$slug"
+    # --force only bypasses git's own dirtiness refusal, which counts
+    # ignored files (.env.worktree, provisioned .env.*). The checks above
+    # already guarantee nothing but ignored files remains.
+    git --git-dir="$WT_GIT_DIR" worktree remove --force "$dest"
+    if [[ "$delete_branch" -eq 1 && -n "$branch" ]]; then
+        git --git-dir="$WT_GIT_DIR" branch -D "$branch" >&2
+    fi
+    git --git-dir="$WT_GIT_DIR" worktree prune
+    [[ "$WT_MODE" == "orchestration" ]] && release_port "$WT_ROOT" "$slug"
+    log "removed $dest"
+}
+
+cmd_prune() {
+    detect_mode
+    git --git-dir="$WT_GIT_DIR" worktree prune --verbose >&2
+    log "pruned"
+}
+
+cmd_doctor() {
+    detect_mode
+    local failures=0 git_version
+
+    log "mode: $WT_MODE"
+    log "root: $WT_ROOT"
+
+    git_version="$(git --version | awk '{print $3}')"
+    if version_at_least "$git_version" "2.48.0"; then
+        log "git $git_version (>= 2.48: relative worktree paths available)"
+    else
+        log "WARNING: git $git_version < 2.48 -- worktrees get absolute pointers; per-worktree containers will not work"
+        failures=$((failures + 1))
+    fi
+
+    if [[ "$(git --git-dir="$WT_GIT_DIR" config worktree.useRelativePaths 2>/dev/null)" == "true" ]] \
+        || [[ "$(git config --global worktree.useRelativePaths 2>/dev/null)" == "true" ]]; then
+        log "worktree.useRelativePaths: true"
+    else
+        log "WARNING: worktree.useRelativePaths not set; new worktrees from other tools get absolute pointers"
+        failures=$((failures + 1))
+    fi
+
+    # Every registered worktree must resolve (catches stale pointers after moves).
+    local wt_path
+    while IFS= read -r wt_path; do
+        [[ -n "$wt_path" ]] || continue
+        if git -C "$wt_path" rev-parse --git-dir >/dev/null 2>&1; then
+            log "worktree ok: $wt_path"
+        else
+            log "WARNING: worktree broken (try 'git worktree repair'): $wt_path"
+            failures=$((failures + 1))
+        fi
+    done < <(git --git-dir="$WT_GIT_DIR" worktree list --porcelain | sed -n 's/^worktree //p')
+
+    if [[ ! -f /.dockerenv ]]; then
+        if command -v devcontainer >/dev/null 2>&1; then
+            local dc_version
+            dc_version="$(devcontainer --version 2>/dev/null)"
+            if version_at_least "$dc_version" "0.81.0"; then
+                log "devcontainer CLI $dc_version (>= 0.81.0: worktree common-dir mounting available)"
+            else
+                log "WARNING: devcontainer CLI ${dc_version:-unknown} < 0.81.0 -- --mount-git-worktree-common-dir unavailable; update the CLI"
+                failures=$((failures + 1))
+            fi
+        else
+            log "note: devcontainer CLI not installed; per-worktree containers unavailable"
+        fi
+    else
+        log "in-container: devcontainer CLI intentionally unavailable (containers never launch containers)"
+    fi
+
+    if [[ "$WT_MODE" == "orchestration" ]]; then
+        if [[ -d "$WT_ROOT/local" ]]; then log "local/ present"; else log "note: no local/ directory"; fi
+        if [[ -d "$WT_ROOT/state" ]]; then log "state/ present"; else log "note: no state/ directory"; fi
+    fi
+
+    if [[ "$failures" -gt 0 ]]; then
+        die "doctor found $failures problem(s)"
+    fi
+    log "doctor: all checks passed"
+}
+
+# ------------------------------------------------------------------ main ----
+
+# Source-guard so tests can load the functions without dispatching.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
+command_name="${1:-}"
+[[ -n "$command_name" ]] || usage
+shift
+
+case "$command_name" in
+    init)         cmd_init "$@" ;;
+    add)          cmd_add "$@" ;;
+    list)         cmd_list "$@" ;;
+    path)         cmd_path "$@" ;;
+    sync)         cmd_sync "$@" ;;
+    diff-local)   cmd_diff_local "$@" ;;
+    container-up) cmd_container_up "$@" ;;
+    exec)         cmd_exec "$@" ;;
+    remove)       cmd_remove "$@" ;;
+    prune)        cmd_prune "$@" ;;
+    doctor)       cmd_doctor "$@" ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $command_name (see wt --help)" ;;
+esac
