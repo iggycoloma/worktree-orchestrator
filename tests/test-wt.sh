@@ -118,6 +118,62 @@ cd "$TMP/slugproj" || exit 1
 assert_file_not_exists "$TMP/slugproj-worktrees/second/.git" "wt remove deletes a clean worktree"
 
 # ============================================================
+# Test Suite: argument and help handling
+# ============================================================
+test_suite "argument and help handling"
+
+# Regression: `wt add --help` used to slugify the flag ('--help' -> 'help')
+# and create a worktree instead of printing help.
+output=$("$WT" add --help 2>&1)
+status=$?
+assert_equals 0 "$status" "wt add --help exits 0"
+assert_contains "$output" "Usage: wt add <name> [base]" "wt add --help prints add's usage"
+assert_file_not_exists "$TMP/slugproj-worktrees/help/.git" "wt add --help creates no worktree"
+
+# Help is answered before any layout detection, so it works anywhere.
+cd "$TMP" || exit 1
+"$WT" add --help >/dev/null 2>&1
+assert_equals 0 $? "wt add --help works outside a repository"
+cd "$TMP/slugproj" || exit 1
+
+output=$("$WT" --help 2>&1)
+assert_equals 0 $? "wt --help exits 0"
+assert_contains "$output" "diff-local <name>" "wt --help lists every command"
+assert_contains "$output" "'wt <command> --help'" "wt --help points at per-command help"
+
+output=$("$WT" help sync 2>&1)
+assert_equals 0 $? "wt help <command> exits 0"
+assert_contains "$output" "Usage: wt sync <name|--all>" "wt help sync prints sync's usage"
+
+# A bare invocation is a usage error: stderr, exit 2.
+"$WT" >/dev/null 2>&1
+assert_equals 2 $? "bare wt exits 2"
+assert_equals "" "$("$WT" 2>/dev/null)" "bare wt writes usage to stderr, not stdout"
+
+# Stray flags are rejected rather than becoming worktree names.
+output=$("$WT" add -x 2>&1)
+assert_not_equals 0 $? "wt add -x fails"
+assert_contains "$output" "unknown option: -x" "wt add -x names the offending flag"
+assert_file_not_exists "$TMP/slugproj-worktrees/x/.git" "wt add -x creates no worktree"
+
+output=$("$WT" add one two three 2>&1)
+assert_not_equals 0 $? "wt add rejects extra positional arguments"
+assert_contains "$output" "usage: wt add <name> [base]" "arity error shows the synopsis"
+
+output=$("$WT" sync -x 2>&1)
+assert_not_equals 0 $? "wt sync -x fails"
+assert_contains "$output" "unknown option: -x" "wt sync -x names the offending flag"
+
+output=$("$WT" bogus 2>&1)
+assert_not_equals 0 $? "unknown command fails"
+assert_contains "$output" "unknown command: bogus" "unknown command is named"
+
+# Everything after '--' belongs to the container command, help flags included.
+output=$("$WT" exec nosuch -- tool --help 2>&1)
+assert_not_contains "$output" "Usage: wt exec" "wt exec passes --help after -- to the command"
+assert_contains "$output" "no such worktree" "wt exec resolves the worktree instead of printing help"
+
+# ============================================================
 # Test Suite: orchestration mode
 # ============================================================
 test_suite "orchestration mode"

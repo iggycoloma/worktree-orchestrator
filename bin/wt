@@ -14,27 +14,117 @@ set -euo pipefail
 # now -- split into bootstrap/lib/wt/ when the devcontainer/compose commands
 # land (Phase 5).
 
-usage() {
-    cat >&2 <<'HELP'
-Usage: wt <command> [args]
-
-  init <url> <dir>      create an orchestration dir (bare clone + local/ state/ main/ wt/)
-  add <name> [base]     create a worktree (+ provision local files in orchestration mode)
-  list                  list worktrees for the current project
-  path <name>           print the worktree's path
-  sync <name|--all>     refresh local/shared into a worktree, 'main', or all (templates untouched)
-  diff-local <name>     show drift between local/shared and a worktree's copies
-  container-up <name>   start the worktree's dev container (host only)
-  exec <name> -- <cmd>  run a command in the worktree's dev container (host only)
-  remove <name> [--branch]  remove a worktree + its containers (refuses dirty)
-  prune                 clean up stale worktree administrative entries
-  doctor                check layout, git version, pointers, and tooling
-HELP
-    exit 2
-}
-
 log()  { printf 'wt: %s\n' "$*" >&2; }
 die()  { printf 'wt: error: %s\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------------ help ----
+
+WT_COMMANDS=(init add list path sync diff-local container-up exec remove prune doctor)
+
+# Single source of truth per command: "<synopsis>\t<description>". The
+# command table, per-command --help, and every usage error read from here,
+# so they cannot drift apart.
+command_spec() {
+    case "$1" in
+        init)         printf '%s\t%s' 'init <url> <dir>'         'create an orchestration dir (bare clone + local/ state/ main/ wt/)' ;;
+        add)          printf '%s\t%s' 'add <name> [base]'        'create a worktree (+ provision local files in orchestration mode)' ;;
+        list)         printf '%s\t%s' 'list'                     'list worktrees for the current project' ;;
+        path)         printf '%s\t%s' 'path <name>'              "print the worktree's path" ;;
+        sync)         printf '%s\t%s' 'sync <name|--all>'        "refresh local/shared into a worktree, 'main', or all (templates untouched)" ;;
+        diff-local)   printf '%s\t%s' 'diff-local <name>'        "show drift between local/shared and a worktree's copies" ;;
+        container-up) printf '%s\t%s' 'container-up <name>'      "start the worktree's dev container (host only)" ;;
+        exec)         printf '%s\t%s' 'exec <name> -- <cmd...>'  "run a command in the worktree's dev container (host only)" ;;
+        remove)       printf '%s\t%s' 'remove <name> [--branch]' 'remove a worktree + its containers (refuses dirty)' ;;
+        prune)        printf '%s\t%s' 'prune'                    'clean up stale worktree administrative entries' ;;
+        doctor)       printf '%s\t%s' 'doctor'                   'check layout, git version, pointers, and tooling' ;;
+        *) return 1 ;;
+    esac
+}
+
+command_synopsis() {
+    local spec
+    spec="$(command_spec "$1")" || return 1
+    printf 'wt %s\n' "${spec%%$'\t'*}"
+}
+
+command_notes() {
+    case "$1" in
+        add) cat <<'NOTE'
+  <name> doubles as the branch name when it is a legal ref (e.g. user/CLK-943);
+  otherwise the branch is the slugified name. [base] defaults to origin's
+  default branch, and is used only when the branch does not already exist.
+NOTE
+        ;;
+        sync) cat <<'NOTE'
+  <name> may be a worktree name, 'main' (orchestration mode), or an absolute
+  path. --all syncs main plus every registered worktree in one pass.
+  local/shared is overwritten in the worktree; local/template is never touched
+  after the initial copy.
+NOTE
+        ;;
+        remove) cat <<'NOTE'
+  Refuses to run when the worktree has staged, unstaged, or untracked changes.
+  --branch also deletes the worktree's branch.
+NOTE
+        ;;
+        exec) cat <<'NOTE'
+  Everything after -- is passed to the container verbatim, including flags:
+  'wt exec api -- pytest --help' runs pytest's help, not wt's.
+NOTE
+        ;;
+    esac
+}
+
+# status 0 (an explicit help request) prints to stdout; anything else is a
+# usage error and goes to stderr.
+emit() {
+    local status="$1"; shift
+    if [[ "$status" -eq 0 ]]; then printf '%s\n' "$*"; else printf '%s\n' "$*" >&2; fi
+    exit "$status"
+}
+
+usage() {
+    local status="${1:-2}" cmd spec
+    emit "$status" "$(
+        printf 'Usage: wt <command> [args]\n\n'
+        for cmd in "${WT_COMMANDS[@]}"; do
+            spec="$(command_spec "$cmd")"
+            printf '  %-26s%s\n' "${spec%%$'\t'*}" "${spec#*$'\t'}"
+        done
+        printf "\nRun 'wt <command> --help' for detail on one command."
+    )"
+}
+
+command_help() {
+    local cmd="$1" spec notes
+    spec="$(command_spec "$cmd")" || die "unknown command: $cmd (see 'wt --help')"
+    notes="$(command_notes "$cmd")"
+    emit 0 "$(
+        printf 'Usage: wt %s\n\n  %s\n' "${spec%%$'\t'*}" "${spec#*$'\t'}"
+        [[ -n "$notes" ]] && printf '\n%s\n' "$notes"
+    )"
+}
+
+# ------------------------------------------------------------ arg guards ----
+
+# A worktree name never starts with '-'. Without this guard a mistyped or
+# unsupported flag is slugified into a name: 'wt add --help' used to create
+# a worktree called 'help'.
+require_name() {
+    local cmd="$1" name="${2:-}"
+    [[ -n "$name" ]] || die "usage: $(command_synopsis "$cmd")"
+    case "$name" in -*) die "unknown option: $name (see 'wt $cmd --help')" ;; esac
+}
+
+# Arity and stray-flag guard for the fully positional commands.
+check_args() {
+    local cmd="$1" min="$2" max="$3" arg
+    shift 3
+    [[ $# -ge "$min" && $# -le "$max" ]] || die "usage: $(command_synopsis "$cmd")"
+    for arg in "$@"; do
+        case "$arg" in -*) die "unknown option: $arg (see 'wt $cmd --help')" ;; esac
+    done
+}
 
 # ---------------------------------------------------------------- layout ----
 
@@ -351,8 +441,8 @@ dotfiles_repo() {
 }
 
 cmd_container_up() {
-    local name="${1:-}"
-    [[ -n "$name" ]] || die "usage: wt container-up <name>"
+    check_args container-up 1 1 "$@"
+    local name="$1"
     detect_mode
     local dest slug repo
     dest="$(resolve_worktree "$name")"
@@ -370,10 +460,10 @@ cmd_container_up() {
 
 cmd_exec() {
     local name="${1:-}"
-    [[ -n "$name" ]] || die "usage: wt exec <name> -- <command...>"
+    require_name exec "$name"
     shift
     [[ "${1:-}" == "--" ]] && shift
-    [[ $# -gt 0 ]] || die "usage: wt exec <name> -- <command...>"
+    [[ $# -gt 0 ]] || die "usage: $(command_synopsis exec)"
     detect_mode
     local dest slug
     dest="$(resolve_worktree "$name")"
@@ -414,8 +504,8 @@ teardown_containers() {
 # ------------------------------------------------------------- commands ----
 
 cmd_init() {
-    local url="${1:-}" root="${2:-}"
-    [[ -n "$url" && -n "$root" ]] || die "usage: wt init <remote-url> <project-dir>"
+    check_args init 2 2 "$@"
+    local url="$1" root="$2"
     [[ ! -e "$root/repo.git" ]] || die "already initialized: $root/repo.git"
 
     mkdir -p "$root/local/shared" "$root/local/template" "$root/state" "$root/wt"
@@ -445,8 +535,8 @@ cmd_init() {
 }
 
 cmd_add() {
-    local name="${1:-}" base="${2:-}"
-    [[ -n "$name" ]] || die "usage: wt add <name> [base]"
+    check_args add 1 2 "$@"
+    local name="$1" base="${2:-}"
     detect_mode
     [[ "$WT_MODE" != "orchestration" || "$name" != "main" ]] \
         || die "'main' is reserved for the stable checkout (use 'wt sync main' to provision it)"
@@ -490,14 +580,15 @@ cmd_add() {
 }
 
 cmd_list() {
+    check_args list 0 0 "$@"
     detect_mode
     log "mode: $WT_MODE (root: $WT_ROOT)"
     git --git-dir="$WT_GIT_DIR" worktree list
 }
 
 cmd_path() {
-    local name="${1:-}"
-    [[ -n "$name" ]] || die "usage: wt path <name>"
+    check_args path 1 1 "$@"
+    local name="$1"
     detect_mode
     local dest
     dest="$(resolve_worktree "$name")"
@@ -506,8 +597,9 @@ cmd_path() {
 }
 
 cmd_sync() {
-    local name="${1:-}"
-    [[ -n "$name" ]] || die "usage: wt sync <name|--all>"
+    [[ $# -eq 1 ]] || die "usage: $(command_synopsis sync)"
+    local name="$1"
+    [[ "$name" == "--all" ]] || require_name sync "$name"
     detect_mode
     [[ "$WT_MODE" == "orchestration" ]] || die "sync requires an orchestration dir (clone mode has no local/ source)"
 
@@ -541,8 +633,8 @@ cmd_sync() {
 }
 
 cmd_diff_local() {
-    local name="${1:-}"
-    [[ -n "$name" ]] || die "usage: wt diff-local <name>"
+    check_args diff-local 1 1 "$@"
+    local name="$1"
     detect_mode
     [[ "$WT_MODE" == "orchestration" ]] || die "diff-local requires an orchestration dir"
     local dest shared src rel drift=0
@@ -573,11 +665,11 @@ cmd_remove() {
     for arg in "$@"; do
         case "$arg" in
             --branch) delete_branch=1 ;;
-            -*) die "unknown option: $arg" ;;
-            *) [[ -n "$name" ]] && die "usage: wt remove <name> [--branch]"; name="$arg" ;;
+            -*) die "unknown option: $arg (see 'wt remove --help')" ;;
+            *) [[ -n "$name" ]] && die "usage: $(command_synopsis remove)"; name="$arg" ;;
         esac
     done
-    [[ -n "$name" ]] || die "usage: wt remove <name> [--branch]"
+    [[ -n "$name" ]] || die "usage: $(command_synopsis remove)"
     detect_mode
     [[ "$WT_MODE" != "orchestration" || "$name" != "main" ]] \
         || die "refusing to remove the stable main/ checkout"
@@ -608,12 +700,14 @@ cmd_remove() {
 }
 
 cmd_prune() {
+    check_args prune 0 0 "$@"
     detect_mode
     git --git-dir="$WT_GIT_DIR" worktree prune --verbose >&2
     log "pruned"
 }
 
 cmd_doctor() {
+    check_args doctor 0 0 "$@"
     detect_mode
     local failures=0 git_version
 
@@ -684,8 +778,25 @@ if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
 fi
 
 command_name="${1:-}"
-[[ -n "$command_name" ]] || usage
+[[ -n "$command_name" ]] || usage 2
 shift
+
+case "$command_name" in
+    -h|--help) usage 0 ;;
+    help) [[ $# -gt 0 ]] && command_help "$1"; usage 0 ;;
+esac
+
+command_spec "$command_name" >/dev/null || die "unknown command: $command_name (see 'wt --help')"
+
+# A help flag must print help, never run the command: 'wt add --help' used to
+# reach cmd_add and create a worktree named 'help'. Scanning stops at '--' so
+# 'wt exec x -- tool --help' still reaches the tool.
+for help_arg in "$@"; do
+    case "$help_arg" in
+        --) break ;;
+        -h|--help) command_help "$command_name" ;;
+    esac
+done
 
 case "$command_name" in
     init)         cmd_init "$@" ;;
@@ -699,6 +810,5 @@ case "$command_name" in
     remove)       cmd_remove "$@" ;;
     prune)        cmd_prune "$@" ;;
     doctor)       cmd_doctor "$@" ;;
-    -h|--help|help) usage ;;
-    *) die "unknown command: $command_name (see wt --help)" ;;
+    *) die "unknown command: $command_name (see 'wt --help')" ;;
 esac
