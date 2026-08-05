@@ -270,6 +270,24 @@ assert_equals "drwx------" "$perms" "local/ is chmod 700"
 rel=$(git --git-dir="$TMP/proj/repo.git" config worktree.useRelativePaths)
 assert_equals "true" "$rel" "init sets worktree.useRelativePaths on repo.git"
 
+refspec=$(git --git-dir="$TMP/proj/repo.git" config remote.origin.fetch)
+assert_equals '+refs/heads/*:refs/remotes/origin/*' "$refspec" \
+    "init sets a fetch refspec (bare clones have none)"
+origin_head=$(git --git-dir="$TMP/proj/repo.git" symbolic-ref --short refs/remotes/origin/HEAD)
+assert_equals "origin/main" "$origin_head" "init points origin/HEAD at the default branch"
+
+# Plain `git fetch origin` must actually move origin/* -- the whole point
+# of the refspec. Advance the remote out-of-band, fetch, compare.
+git clone -q "$TMP/remote-orch.git" "$TMP/seed-fetch" 2>/dev/null
+git -C "$TMP/seed-fetch" commit -q --allow-empty -m advance
+git -C "$TMP/seed-fetch" push -q origin HEAD
+remote_tip=$(git --git-dir="$TMP/remote-orch.git" rev-parse HEAD)
+rm -rf "$TMP/seed-fetch"
+git -C "$TMP/proj/main" fetch -q origin
+fetched_tip=$(git --git-dir="$TMP/proj/repo.git" rev-parse refs/remotes/origin/main)
+assert_equals "$remote_tip" "$fetched_tip" \
+    "plain 'git fetch origin' updates origin/main in an init'd layout"
+
 cd "$TMP/proj" || exit 1
 dest=$("$WT" add issue-123 2>/dev/null)
 assert_equals "$TMP/proj/wt/issue-123" "$dest" "orchestration worktrees land in wt/"
@@ -469,6 +487,15 @@ status=$?
 assert_equals 0 "$status" "doctor passes on a healthy orchestration dir"
 assert_contains "$output" "mode: orchestration" "doctor reports orchestration mode"
 assert_contains "$output" "useRelativePaths: true" "doctor confirms relative paths config"
+assert_contains "$output" "remote.origin.fetch: configured" "doctor confirms the fetch refspec"
+
+# A pre-fix layout (bare clone, no refspec) must fail doctor with the repair command.
+git --git-dir="$TMP/proj/repo.git" config --unset-all remote.origin.fetch
+output=$("$WT" doctor 2>&1)
+assert_not_equals 0 $? "doctor fails when origin has no fetch refspec"
+assert_contains "$output" "no fetch refspec" "doctor names the missing refspec"
+assert_contains "$output" "config remote.origin.fetch" "doctor prints the repair command"
+git --git-dir="$TMP/proj/repo.git" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
 
 # ============================================================
 # Test Suite: post-checkout safety-net hook

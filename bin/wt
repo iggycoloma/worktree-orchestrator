@@ -595,10 +595,19 @@ cmd_init() {
         die "clone failed; nothing initialized at $root"
     fi
     git --git-dir="$root/repo.git" config worktree.useRelativePaths true
+    # Bare clones carry no fetch refspec, which would make every later
+    # `git fetch origin` a silent no-op and leave refs/remotes/origin/*
+    # (and therefore default_base) permanently empty.
+    git --git-dir="$root/repo.git" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
 
     local default_branch
     default_branch="$(git --git-dir="$root/repo.git" symbolic-ref --short HEAD 2>/dev/null || true)"
     default_branch="${default_branch:-main}"
+    git --git-dir="$root/repo.git" fetch --quiet origin \
+        || log "warning: initial fetch failed; refs/remotes/origin/* will populate on the next 'git fetch origin'"
+    if git --git-dir="$root/repo.git" rev-parse --verify --quiet "refs/remotes/origin/$default_branch" >/dev/null; then
+        git --git-dir="$root/repo.git" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default_branch"
+    fi
     ensure_rel_flag
     # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
     if ! git --git-dir="$root/repo.git" worktree add $WT_REL_FLAG "$root/main" "$default_branch" >&2; then
@@ -832,6 +841,15 @@ cmd_doctor() {
     else
         log "WARNING: worktree.useRelativePaths not set; new worktrees from other tools get absolute pointers"
         failures=$((failures + 1))
+    fi
+
+    if [[ "$WT_MODE" == "orchestration" ]]; then
+        if git --git-dir="$WT_GIT_DIR" config --get-all remote.origin.fetch >/dev/null 2>&1; then
+            log "remote.origin.fetch: configured"
+        else
+            log "WARNING: origin has no fetch refspec (pre-fix bare clone) -- 'git fetch origin' is a silent no-op; fix: git --git-dir='$WT_GIT_DIR' config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'"
+            failures=$((failures + 1))
+        fi
     fi
 
     # Every registered worktree must resolve (catches stale pointers after moves).
