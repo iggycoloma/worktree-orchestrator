@@ -19,7 +19,7 @@ die()  { printf 'wt: error: %s\n' "$*" >&2; exit 1; }
 
 # ------------------------------------------------------------------ help ----
 
-WT_COMMANDS=(init add list path sync diff-local container-up exec remove prune doctor)
+WT_COMMANDS=(init add go list path sync diff-local container-up exec remove prune doctor)
 
 # Single source of truth per command: "<synopsis>\t<description>". The
 # command table, per-command --help, and every usage error read from here,
@@ -28,7 +28,8 @@ command_spec() {
     case "$1" in
         init)         printf '%s\t%s' 'init <url> <dir>'         'create an orchestration dir (bare clone + local/ state/ main/ wt/)' ;;
         add)          printf '%s\t%s' 'add <name> [base]'        'create a worktree (+ provision local files in orchestration mode)' ;;
-        list)         printf '%s\t%s' 'list'                     'list worktrees for the current project' ;;
+        go)           printf '%s\t%s' 'go [name]'                'cd into a worktree (no name: the stable checkout)' ;;
+        list)         printf '%s\t%s' 'list [--names]'           'list worktrees for the current project' ;;
         path)         printf '%s\t%s' 'path <name>'              "print the worktree's path" ;;
         sync)         printf '%s\t%s' 'sync <name|--all>'        "refresh local/shared into a worktree, 'main', or all (templates untouched)" ;;
         diff-local)   printf '%s\t%s' 'diff-local <name>'        "show drift between local/shared and a worktree's copies" ;;
@@ -53,6 +54,20 @@ command_notes() {
   <name> doubles as the branch name when it is a legal ref (e.g. user/CLK-943);
   otherwise the branch is the slugified name. [base] defaults to origin's
   default branch, and is used only when the branch does not already exist.
+NOTE
+        ;;
+        go) cat <<'NOTE'
+  <name> may be a worktree name or any unambiguous prefix of one, so a
+  truncated slug never has to be typed in full. With no name: main/ in
+  orchestration mode, the repository root in clone mode.
+
+  Only the shell function changes directory; the binary prints the path,
+  which is what makes `cd "$(wt go x)"` work from scripts.
+NOTE
+        ;;
+        list) cat <<'NOTE'
+  --names prints one bare directory name per line with no header, for shell
+  completion and scripting.
 NOTE
         ;;
         sync) cat <<'NOTE'
@@ -187,11 +202,29 @@ ensure_rel_flag() {
     fi
 }
 
+# Ticket-tracker branch names ("CLK-1287-add-support-for-import-broker-from-
+# -the-marketplace") are long enough that the worktree path stops being
+# readable or typeable. 40 characters keeps the ticket id and enough words
+# to identify the branch; `wt go` resolves prefixes, so the truncated tail
+# is never something you have to type in full.
+WT_SLUG_MAX=40
+
 normalize_slug() {
-    printf '%s' "${1:?}" \
+    local slug next
+    slug="$(printf '%s' "${1:?}" \
         | tr '[:upper:]' '[:lower:]' \
-        | sed -e 's/[^a-z0-9._-]\{1,\}/-/g' -e 's/^[-.]*//' -e 's/[-.]*$//' \
-        | cut -c1-48
+        | sed -e 's/[^a-z0-9._-]\{1,\}/-/g' -e 's/^[-.]*//' -e 's/[-.]*$//')"
+    if [[ "${#slug}" -gt "$WT_SLUG_MAX" ]]; then
+        next="${slug:$WT_SLUG_MAX:1}"
+        slug="${slug:0:$WT_SLUG_MAX}"
+        # Cut back to a word boundary so the slug ends in a whole word --
+        # unless the budget already landed on one, or the name has no '-'
+        # to retreat to and a hard truncation is all that is available.
+        [[ "$next" == "-" || "$slug" != *-* ]] || slug="${slug%-*}"
+    fi
+    # Re-trim: truncating mid-name can expose a trailing '-' or '.' that
+    # the first pass had already removed.
+    printf '%s' "$slug" | sed -e 's/[-.]*$//'
 }
 
 # Base ref for new branches: origin's default branch, degrading to HEAD.
@@ -219,20 +252,63 @@ worktree_dest() {
     fi
 }
 
+# Every worktree path git has registered for this project, minus the bare
+# repo itself (listed in orchestration mode, but it has no working tree).
+registered_worktrees() {
+    local path
+    while IFS= read -r path; do
+        [[ -n "$path" && "$path" != "$WT_GIT_DIR" ]] || continue
+        printf '%s\n' "$path"
+    done < <(git --git-dir="$WT_GIT_DIR" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+}
+
+# Registered worktrees whose directory name is, or begins with, $1. An exact
+# match wins outright and short-circuits, so a slug that happens to prefix a
+# longer one still resolves to itself.
+match_worktrees() {
+    local needle="$1" path base prefixes=""
+    while IFS= read -r path; do
+        base="${path##*/}"
+        [[ "$base" != "$needle" ]] || { printf '%s\n' "$path"; return 0; }
+        case "$base" in "$needle"*) prefixes="${prefixes}${path}"$'\n' ;; esac
+    done < <(registered_worktrees)
+    printf '%s' "$prefixes"
+}
+
 # Resolve an EXISTING worktree by name. Unlike worktree_dest (the creation
 # mapping), this also resolves the stable main/ checkout, which is simply
 # one worktree and gets synced like any other, and accepts an absolute
 # path -- needed for worktrees created outside wt whose directory name is
 # not a slug (the post-checkout hook passes the path for exactly that).
+#
+# When the creation mapping misses, fall back to matching the directory
+# names git actually has. That covers two cases with one lookup: a caller
+# who typed a prefix of a long slug, and a worktree created before
+# WT_SLUG_MAX changed -- shortening the budget must never orphan a
+# worktree that is already on disk.
 resolve_worktree() {
-    local name="$1"
+    local name="$1" dest matches count
     if [[ "$name" == /* && -d "$name" ]]; then
         printf '%s\n' "$name"
-    elif [[ "$WT_MODE" == "orchestration" && "$name" == "main" ]]; then
-        printf '%s\n' "$WT_ROOT/main"
-    else
-        worktree_dest "$name"
+        return 0
     fi
+    if [[ "$WT_MODE" == "orchestration" && "$name" == "main" ]]; then
+        printf '%s\n' "$WT_ROOT/main"
+        return 0
+    fi
+    dest="$(worktree_dest "$name")"
+    if [[ -d "$dest" ]]; then
+        printf '%s\n' "$dest"
+        return 0
+    fi
+
+    matches="$(match_worktrees "$(normalize_slug "${name##*/}")")"
+    count="$(printf '%s' "$matches" | grep -c '^' || true)"
+    case "$count" in
+        0) printf '%s\n' "$dest" ;;
+        1) printf '%s\n' "$matches" ;;
+        *) die "$(printf "'%s' matches %s worktrees:\n%s" "$name" "$count" "$matches")" ;;
+    esac
 }
 
 # ---------------------------------------------------------- provisioning ----
@@ -580,10 +656,37 @@ cmd_add() {
 }
 
 cmd_list() {
-    check_args list 0 0 "$@"
+    local names=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --names) names=1 ;;
+            *) die "usage: $(command_synopsis list)" ;;
+        esac
+    done
     detect_mode
+    if [[ "$names" -eq 1 ]]; then
+        local path
+        while IFS= read -r path; do
+            printf '%s\n' "${path##*/}"
+        done < <(registered_worktrees)
+        return 0
+    fi
     log "mode: $WT_MODE (root: $WT_ROOT)"
     git --git-dir="$WT_GIT_DIR" worktree list
+}
+
+cmd_go() {
+    check_args go 0 1 "$@"
+    detect_mode
+    local dest
+    if [[ $# -eq 0 ]]; then
+        dest="$WT_ROOT"
+        [[ "$WT_MODE" != "orchestration" || ! -d "$WT_ROOT/main" ]] || dest="$WT_ROOT/main"
+    else
+        dest="$(resolve_worktree "$1")"
+    fi
+    [[ -d "$dest" ]] || die "no such worktree: $dest"
+    printf '%s\n' "$dest"
 }
 
 cmd_path() {
@@ -607,9 +710,7 @@ cmd_sync() {
         # Every registered worktree: main/ plus everything under wt/.
         local wt_path failures=0
         while IFS= read -r wt_path; do
-            [[ -n "$wt_path" && -d "$wt_path" ]] || continue
-            # worktree list includes the bare repo itself; it has no tree.
-            [[ "$wt_path" != "$WT_GIT_DIR" ]] || continue
+            [[ -d "$wt_path" ]] || continue
             if provision_local_files "$WT_ROOT" "$wt_path"; then
                 log "synced local/ into $wt_path"
                 write_worktree_env "$WT_ROOT" "$wt_path" "$(basename "$wt_path")"
@@ -618,7 +719,7 @@ cmd_sync() {
                 log "WARNING: sync failed validation for $wt_path; nothing copied there"
                 failures=$((failures + 1))
             fi
-        done < <(git --git-dir="$WT_GIT_DIR" worktree list --porcelain | sed -n 's/^worktree //p')
+        done < <(registered_worktrees)
         [[ "$failures" -eq 0 ]] || die "sync --all: $failures worktree(s) failed validation"
         return 0
     fi
@@ -671,10 +772,13 @@ cmd_remove() {
     done
     [[ -n "$name" ]] || die "usage: $(command_synopsis remove)"
     detect_mode
-    [[ "$WT_MODE" != "orchestration" || "$name" != "main" ]] \
-        || die "refusing to remove the stable main/ checkout"
     local dest branch slug
-    dest="$(worktree_dest "$name")"
+    # resolve_worktree, not worktree_dest: a worktree created under an older
+    # WT_SLUG_MAX must stay removable. Guarding main/ after resolution also
+    # catches the prefixes that now resolve to it.
+    dest="$(resolve_worktree "$name")"
+    [[ "$WT_MODE" != "orchestration" || "$dest" != "$WT_ROOT/main" ]] \
+        || die "refusing to remove the stable main/ checkout"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
     slug="$(basename "$dest")"
 
@@ -733,14 +837,13 @@ cmd_doctor() {
     # Every registered worktree must resolve (catches stale pointers after moves).
     local wt_path
     while IFS= read -r wt_path; do
-        [[ -n "$wt_path" ]] || continue
         if git -C "$wt_path" rev-parse --git-dir >/dev/null 2>&1; then
             log "worktree ok: $wt_path"
         else
             log "WARNING: worktree broken (try 'git worktree repair'): $wt_path"
             failures=$((failures + 1))
         fi
-    done < <(git --git-dir="$WT_GIT_DIR" worktree list --porcelain | sed -n 's/^worktree //p')
+    done < <(registered_worktrees)
 
     if [[ ! -f /.dockerenv ]]; then
         if command -v devcontainer >/dev/null 2>&1; then
@@ -801,6 +904,7 @@ done
 case "$command_name" in
     init)         cmd_init "$@" ;;
     add)          cmd_add "$@" ;;
+    go)           cmd_go "$@" ;;
     list)         cmd_list "$@" ;;
     path)         cmd_path "$@" ;;
     sync)         cmd_sync "$@" ;;

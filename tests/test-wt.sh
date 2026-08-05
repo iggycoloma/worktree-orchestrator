@@ -98,6 +98,26 @@ assert_equals "$TMP/slugproj-worktrees/clk-943_fancy-name" "$dest" \
     "mixed-case path segment normalizes to lowercase leaf slug"
 assert_file_exists "$dest/.git" "worktree created at normalized path"
 
+# Regression: truncation used to run AFTER the trailing-punctuation trim, so a
+# name longer than the budget produced a slug ending in a bare '-'.
+long_name="CLK-1287-add-support-for-import-broker-from-the-marketplace"
+dest_long=$("$WT" add "$long_name" 2>/dev/null)
+# The expected slug ends in a word character, which is the regression: the
+# old ordering yielded 'clk-1287-add-support-for-import-broker-from-the-'.
+assert_equals "$TMP/slugproj-worktrees/clk-1287-add-support-for-import-broker" "$dest_long" \
+    "over-budget name truncates at a word boundary with no trailing dash"
+
+# The branch keeps the full name; only the directory is budgeted.
+branch=$(git -C "$dest_long" symbolic-ref --short HEAD 2>/dev/null)
+assert_equals "$long_name" "$branch" "truncating the slug does not truncate the branch"
+
+# A name with no separator has no word boundary to retreat to, so a hard cut
+# is the only option -- but it must still respect the budget.
+solid=$(printf 'a%.0s' $(seq 1 60))
+dest_solid=$("$WT" add "$solid" 2>/dev/null)
+solid_slug=$(basename "$dest_solid")
+assert_equals 40 "${#solid_slug}" "separator-free name is hard-cut to the budget"
+
 # ============================================================
 # Test Suite: clone mode
 # ============================================================
@@ -116,6 +136,61 @@ assert_contains "$listing" "slugproj-worktrees/second" "wt list shows created wo
 cd "$TMP/slugproj" || exit 1
 "$WT" remove second >/dev/null 2>&1
 assert_file_not_exists "$TMP/slugproj-worktrees/second/.git" "wt remove deletes a clean worktree"
+
+# ============================================================
+# Test Suite: go, --names, and name resolution
+# ============================================================
+test_suite "go and name resolution"
+
+names=$("$WT" list --names 2>/dev/null)
+assert_contains "$names" "clk-1287-add-support-for-import-broker" \
+    "list --names prints bare directory names"
+case "$names" in
+    */*) assert_equals "bare" "paths" "list --names prints no paths" ;;
+    *)   assert_equals "bare" "bare" "list --names prints no paths" ;;
+esac
+
+# go resolves the full name through the same mapping add used...
+dest_go=$("$WT" go "$long_name" 2>/dev/null)
+assert_equals "$TMP/slugproj-worktrees/clk-1287-add-support-for-import-broker" "$dest_go" \
+    "wt go resolves the full over-budget name"
+
+# ...and an unambiguous prefix, which is what makes a truncated slug typeable.
+dest_go=$("$WT" go clk-1287 2>/dev/null)
+assert_equals "$TMP/slugproj-worktrees/clk-1287-add-support-for-import-broker" "$dest_go" \
+    "wt go resolves an unambiguous prefix"
+
+dest_go=$("$WT" go 2>/dev/null)
+assert_equals "$TMP/slugproj" "$dest_go" "bare wt go returns the repo root in clone mode"
+
+output=$("$WT" go nope 2>&1)
+status=$?
+assert_equals 1 "$status" "wt go on an unknown name fails"
+assert_contains "$output" "no such worktree" "wt go on an unknown name explains why"
+
+# A worktree created before the slug budget shrank keeps its longer directory
+# name; resolution must fall back to git's registry so it is never orphaned.
+legacy="clk-9999-a-very-long-legacy-name-from-the-olden"
+git worktree add -q "$TMP/slugproj-worktrees/$legacy" -b legacy 2>/dev/null
+assert_equals "$TMP/slugproj-worktrees/$legacy" "$("$WT" path clk-9999 2>/dev/null)" \
+    "a legacy over-budget slug still resolves by prefix"
+assert_equals "$TMP/slugproj-worktrees/$legacy" \
+    "$("$WT" path "CLK-9999-a-very-long-legacy-name-from-the-olden-days" 2>/dev/null)" \
+    "a legacy slug still resolves from the name that created it"
+"$WT" remove clk-9999 >/dev/null 2>&1
+assert_file_not_exists "$TMP/slugproj-worktrees/$legacy/.git" \
+    "wt remove works on a legacy over-budget slug"
+
+# An ambiguous prefix must name the candidates rather than guess.
+"$WT" add clk-5555-alpha >/dev/null 2>&1
+"$WT" add clk-5555-beta >/dev/null 2>&1
+output=$("$WT" go clk-5555 2>&1)
+status=$?
+assert_equals 1 "$status" "an ambiguous prefix fails"
+assert_contains "$output" "matches 2 worktrees" "an ambiguous prefix reports the count"
+assert_contains "$output" "clk-5555-beta" "an ambiguous prefix lists the candidates"
+"$WT" remove clk-5555-alpha >/dev/null 2>&1
+"$WT" remove clk-5555-beta >/dev/null 2>&1
 
 # ============================================================
 # Test Suite: argument and help handling
@@ -204,6 +279,22 @@ cd "$TMP/proj/wt/issue-123" || exit 1
 nested=$("$WT" add from-inside 2>/dev/null)
 assert_equals "$TMP/proj/wt/from-inside" "$nested" \
     "mode detection walks up: add from inside a worktree stays in wt/"
+
+# In orchestration mode a bare `go` targets the stable checkout, not the root,
+# and `main` stays resolvable as a name rather than matching a wt/ prefix.
+assert_equals "$TMP/proj/main" "$("$WT" go 2>/dev/null)" \
+    "bare wt go returns main/ in orchestration mode"
+assert_equals "$TMP/proj/main" "$("$WT" go main 2>/dev/null)" \
+    "wt go main resolves the stable checkout"
+assert_equals "$TMP/proj/wt/issue-123" "$("$WT" go issue 2>/dev/null)" \
+    "wt go resolves a prefix in orchestration mode"
+
+# main/ must stay un-removable, including via the resolver's prefix path.
+output=$("$WT" remove main 2>&1)
+assert_not_equals 0 $? "wt remove main fails"
+assert_contains "$output" "refusing to remove the stable main" \
+    "wt remove main explains the refusal"
+assert_dir_exists "$TMP/proj/main" "refused removal leaves main/ intact"
 
 # init against an empty remote (unborn HEAD) fails cleanly and rolls back.
 cd "$TMP" || exit 1

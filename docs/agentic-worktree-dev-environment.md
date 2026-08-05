@@ -623,7 +623,8 @@ Expose a single command, for example `wt`, from dotfiles:
 ```text
 wt init <url> <project-directory>
 wt add <name> [base] [--profile profile]
-wt list
+wt go [name]
+wt list [--names]
 wt path <name>
 wt sync <name|--all>
 wt diff-local <name>

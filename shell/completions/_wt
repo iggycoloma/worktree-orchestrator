@@ -1,0 +1,63 @@
+#compdef wt
+# Zsh completion for wt (see bin/wt).
+#
+# Worktree names come from `wt list --names`, which reads git's own worktree
+# registry -- so completion covers worktrees created outside wt, and keeps
+# working for slugs created under an older WT_SLUG_MAX.
+
+_wt_worktrees() {
+    local -a names
+    names=(${(f)"$(wt list --names 2>/dev/null)"})
+    _describe -t worktrees 'worktree' names
+}
+
+_wt_refs() {
+    local -a refs
+    refs=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null)"})
+    _describe -t refs 'base ref' refs
+}
+
+_wt() {
+    local -a commands
+    commands=(
+        'init:create an orchestration dir (bare clone + local/ state/ main/ wt/)'
+        'add:create a worktree'
+        'go:cd into a worktree'
+        'list:list worktrees for the current project'
+        'path:print the worktree'\''s path'
+        'sync:refresh local/shared into a worktree'
+        'diff-local:show drift between local/shared and a worktree'\''s copies'
+        'container-up:start the worktree'\''s dev container'
+        'exec:run a command in the worktree'\''s dev container'
+        'remove:remove a worktree + its containers'
+        'prune:clean up stale worktree administrative entries'
+        'doctor:check layout, git version, pointers, and tooling'
+        'help:show help for a command'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'wt command' commands
+        return
+    fi
+
+    case "${words[2]}" in
+        go|path|diff-local|container-up|exec)
+            (( CURRENT == 3 )) && _wt_worktrees ;;
+        sync)
+            if (( CURRENT == 3 )); then
+                _alternative 'flags:flag:((--all:"sync main plus every worktree"))' \
+                    'worktrees:worktree:_wt_worktrees'
+            fi ;;
+        remove)
+            _alternative 'flags:flag:((--branch:"also delete the branch"))' \
+                'worktrees:worktree:_wt_worktrees' ;;
+        list)
+            _values 'flag' '--names[print bare directory names, one per line]' ;;
+        add)
+            (( CURRENT == 4 )) && _wt_refs ;;
+        help)
+            _describe -t commands 'wt command' commands ;;
+    esac
+}
+
+_wt "$@"
