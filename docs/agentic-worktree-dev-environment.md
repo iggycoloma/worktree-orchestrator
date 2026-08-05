@@ -625,11 +625,13 @@ wt init <url> <project-directory>
 wt add <name> [base] [--profile profile]
 wt go [name]
 wt list [--names]
-wt path <name>
-wt sync <name|--all>
-wt diff-local <name>
+wt path [name]
+wt pull [name]
+wt git <name> <git-arguments...>
+wt sync [name|--all] [--diff]
 wt open <name>
-wt container-up <name>
+wt container up [name]
+wt container exec <name> -- <command...>
 wt compose <name> -- <compose arguments...>
 wt doctor [name]
 wt remove <name> [--branch] [--volumes]

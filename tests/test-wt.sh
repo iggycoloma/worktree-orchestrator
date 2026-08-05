@@ -213,12 +213,12 @@ cd "$TMP/slugproj" || exit 1
 
 output=$("$WT" --help 2>&1)
 assert_equals 0 $? "wt --help exits 0"
-assert_contains "$output" "diff-local <name>" "wt --help lists every command"
+assert_contains "$output" "container up|exec" "wt --help lists every command"
 assert_contains "$output" "'wt <command> --help'" "wt --help points at per-command help"
 
 output=$("$WT" help sync 2>&1)
 assert_equals 0 $? "wt help <command> exits 0"
-assert_contains "$output" "Usage: wt sync <name|--all>" "wt help sync prints sync's usage"
+assert_contains "$output" "Usage: wt sync [name|--all] [--diff]" "wt help sync prints sync's usage"
 
 # A bare invocation is a usage error: stderr, exit 2.
 "$WT" >/dev/null 2>&1
@@ -244,9 +244,9 @@ assert_not_equals 0 $? "unknown command fails"
 assert_contains "$output" "unknown command: bogus" "unknown command is named"
 
 # Everything after '--' belongs to the container command, help flags included.
-output=$("$WT" exec nosuch -- tool --help 2>&1)
-assert_not_contains "$output" "Usage: wt exec" "wt exec passes --help after -- to the command"
-assert_contains "$output" "no such worktree" "wt exec resolves the worktree instead of printing help"
+output=$("$WT" container exec nosuch -- tool --help 2>&1)
+assert_not_contains "$output" "Usage: wt container" "container exec passes --help after -- to the command"
+assert_contains "$output" "no such worktree" "container exec resolves the worktree instead of printing help"
 
 # ============================================================
 # Test Suite: orchestration mode
@@ -356,18 +356,18 @@ assert_file_not_exists "$TMP/proj/wt/rejected/.git" "failed add rolls the worktr
 rm -f local/shared/not-ignored.txt
 
 # ============================================================
-# Test Suite: sync and diff-local
+# Test Suite: sync and sync --diff
 # ============================================================
-test_suite "sync and diff-local"
+test_suite "sync and sync --diff"
 
 cd "$TMP/proj" || exit 1
 dest="$TMP/proj/wt/provisioned"
 
 # shared drifted earlier (SANDBOX_KEY=xyz written after provisioning abc)
-output=$("$WT" diff-local provisioned 2>&1)
+output=$("$WT" sync --diff provisioned 2>&1)
 status=$?
-assert_not_equals 0 "$status" "diff-local exits nonzero on drift"
-assert_contains "$output" "differs" "diff-local reports the drifted file"
+assert_not_equals 0 "$status" "sync --diff exits nonzero on drift"
+assert_contains "$output" "differs" "sync --diff reports the drifted file"
 
 "$WT" sync provisioned >/dev/null 2>&1
 synced=$(cat "$dest/.env.shared")
@@ -375,15 +375,30 @@ assert_equals "SANDBOX_KEY=xyz" "$synced" "sync overwrites shared copies"
 customized=$(cat "$dest/.env.local")
 assert_equals "CUSTOMIZED=1" "$customized" "sync leaves customized template files alone"
 
-output=$("$WT" diff-local provisioned 2>&1)
-assert_equals 0 $? "diff-local passes after sync"
+output=$("$WT" sync --diff provisioned 2>&1)
+assert_equals 0 $? "sync --diff passes after sync"
 
-# The stable main/ checkout syncs like any other worktree.
-"$WT" sync main >/dev/null 2>&1
-assert_equals 0 $? "wt sync main succeeds"
-assert_file_exists "$TMP/proj/main/.env.shared" "sync main provisions the stable checkout"
+# --diff never writes: the drifted copy must survive the preview untouched.
+printf 'SANDBOX_KEY=preview\n' > local/shared/.env.shared
+"$WT" sync --diff provisioned >/dev/null 2>&1
+assert_equals "SANDBOX_KEY=xyz" "$(cat "$dest/.env.shared")" \
+    "sync --diff leaves the worktree copy untouched"
+
+# --diff --all prefixes each line with the tree it belongs to.
+output=$("$WT" sync --diff --all 2>&1)
+assert_not_equals 0 $? "sync --diff --all exits nonzero on drift"
+assert_contains "$output" $'provisioned\tdiffers' "sync --diff --all attributes drift per tree"
+printf 'SANDBOX_KEY=xyz\n' > local/shared/.env.shared
+
+# The stable main/ checkout syncs like any other worktree -- and is the
+# default when no name is given.
+"$WT" sync >/dev/null 2>&1
+assert_equals 0 $? "wt sync with no name succeeds"
+assert_file_exists "$TMP/proj/main/.env.shared" "bare sync provisions the stable checkout"
 main_path=$("$WT" path main 2>/dev/null)
 assert_equals "$TMP/proj/main" "$main_path" "wt path main resolves the stable checkout"
+assert_equals "$TMP/proj/main" "$("$WT" path 2>/dev/null)" \
+    "wt path with no name defaults to the stable checkout"
 
 # main is protected from add and remove.
 output=$("$WT" add main 2>&1)
@@ -433,25 +448,35 @@ assert_equals "yes" "$released" "remove releases the allocated port"
 # ============================================================
 test_suite "container gating"
 
+# The noun group rejects unknown subcommands before doing anything else.
+output=$("$WT" container 2>&1)
+assert_not_equals 0 $? "bare wt container is a usage error"
+assert_contains "$output" "usage: wt container" "bare container prints the synopsis"
+output=$("$WT" container bogus 2>&1)
+assert_not_equals 0 $? "unknown container subcommand fails"
+
+# exec's -- separator is mandatory: without it the container command's
+# flags would leak into wt's own parsing.
+output=$("$WT" container exec provisioned true 2>&1)
+assert_not_equals 0 $? "container exec without -- is a usage error"
+assert_contains "$output" "usage: wt container" "missing -- prints the synopsis"
+
 # Name resolution precedes any docker/CLI requirement, in every environment.
-output=$("$WT" exec nonexistent -- true 2>&1)
-assert_not_equals 0 $? "exec fails on an unknown worktree"
-assert_contains "$output" "no such worktree" "exec resolves the name before the docker check"
+output=$("$WT" container exec nonexistent -- true 2>&1)
+assert_not_equals 0 $? "container exec fails on an unknown worktree"
+assert_contains "$output" "no such worktree" "container exec resolves the name before the docker check"
 
 if [[ -f /.dockerenv ]]; then
-    output=$("$WT" container-up provisioned 2>&1)
+    output=$("$WT" container up provisioned 2>&1)
     status=$?
-    assert_not_equals 0 "$status" "container-up refuses to run inside a container"
+    assert_not_equals 0 "$status" "container up refuses to run inside a container"
     assert_contains "$output" "host-only" "refusal explains containers never launch containers"
-    output=$("$WT" exec provisioned -- true 2>&1)
-    assert_not_equals 0 $? "exec refuses to run inside a container"
-    # main resolves (would otherwise be "no such worktree") and then hits
-    # the host-only gate -- proving container commands accept main.
-    output=$("$WT" exec main -- true 2>&1)
-    assert_contains "$output" "host-only" "exec resolves main before the host-only refusal"
-else
-    output=$("$WT" container-up 2>&1)
-    assert_not_equals 0 $? "container-up requires a name"
+    output=$("$WT" container exec provisioned -- true 2>&1)
+    assert_not_equals 0 $? "container exec refuses to run inside a container"
+    # No name: up defaults to main, which resolves (would otherwise be
+    # "no such worktree") and then hits the host-only gate.
+    output=$("$WT" container up 2>&1)
+    assert_contains "$output" "host-only" "container up with no name resolves main before the host-only refusal"
 fi
 
 # ============================================================
@@ -659,6 +684,140 @@ assert_equals 0 $? "garbage PORT_RANGE values do not abort sync"
 assert_contains "$output" "invalid PORT_RANGE_START" "bad range is reported"
 port_kept=$(sed -n 's/^APP_PORT=//p' "$dest/.env.worktree")
 assert_equals "$port_before" "$port_kept" "existing allocation survives a bad range"
+
+# ============================================================
+# Test Suite: pull and git pass-through
+# ============================================================
+test_suite "pull and git pass-through"
+
+make_remote "$TMP/remote-pull.git"
+"$WT" init "$TMP/remote-pull.git" "$TMP/pullproj" >/dev/null 2>&1
+cd "$TMP/pullproj" || exit 1
+
+# Advance the remote out-of-band so the layout is stale.
+advance_remote() {
+    local remote="$1" msg="$2" branch="${3:-}"
+    git clone -q "$remote" "$TMP/seed-adv" 2>/dev/null
+    if [[ -n "$branch" ]]; then git -C "$TMP/seed-adv" checkout -q -B "$branch" "origin/$branch"; fi
+    git -C "$TMP/seed-adv" commit -q --allow-empty -m "$msg"
+    git -C "$TMP/seed-adv" push -q origin HEAD
+    rm -rf "$TMP/seed-adv"
+}
+
+# wt git: verbatim pass-through into the named worktree.
+out=$("$WT" git main rev-parse --abbrev-ref HEAD)
+assert_equals "main" "$out" "wt git runs in the named worktree"
+out=$("$WT" git main log --oneline -1)
+assert_contains "$out" "init" "wt git passes flags through verbatim"
+"$WT" git main rev-parse --verify --quiet refs/heads/nope >/dev/null 2>&1
+assert_not_equals 0 $? "wt git propagates git's exit code"
+output=$("$WT" git nope status 2>&1)
+assert_not_equals 0 $? "wt git fails on an unknown worktree"
+assert_contains "$output" "no such worktree" "wt git names the missing worktree"
+output=$("$WT" git --help)
+assert_equals 0 $? "wt git --help is wt's help, not a worktree lookup"
+assert_contains "$output" "verbatim" "wt git help documents the pass-through"
+output=$("$WT" git 2>&1)
+assert_not_equals 0 $? "wt git without a name is a usage error"
+
+# wt pull with no name fast-forwards main/ from anywhere in the layout.
+advance_remote "$TMP/remote-pull.git" advance-1
+remote_tip=$(git --git-dir="$TMP/remote-pull.git" rev-parse HEAD)
+feature=$("$WT" add pull-feature 2>/dev/null)
+cd "$feature" || exit 1
+"$WT" pull >/dev/null 2>&1
+assert_equals 0 $? "wt pull succeeds from inside a feature worktree"
+assert_equals "$remote_tip" "$(git -C "$TMP/pullproj/main" rev-parse HEAD)" \
+    "wt pull default target is main/, fast-forwarded to the remote tip"
+cd "$TMP/pullproj" || exit 1
+
+# add pre-fetch: the feature branched AFTER the remote advanced must start
+# at the true remote head even though nothing fetched explicitly.
+assert_equals "$remote_tip" "$(git -C "$feature" rev-parse HEAD)" \
+    "wt add fetches first: new branch starts at the true remote head"
+
+# Dirty main/ is refused.
+printf 'dirty\n' >> "$TMP/pullproj/main/.gitignore"
+output=$("$WT" pull 2>&1)
+assert_not_equals 0 $? "wt pull refuses a dirty main/"
+assert_contains "$output" "unstaged changes" "pull names the dirtiness"
+git -C "$TMP/pullproj/main" checkout -q -- .gitignore
+
+# A diverged main/ is an error, never an implicit merge.
+git -C "$TMP/pullproj/main" commit -q --allow-empty -m local-divergence
+advance_remote "$TMP/remote-pull.git" advance-2
+output=$("$WT" pull 2>&1)
+assert_not_equals 0 $? "wt pull refuses to merge a diverged main/"
+assert_contains "$output" "fast-forward" "divergence error names the ff-only policy"
+git -C "$TMP/pullproj/main" reset -q --hard origin/main
+"$WT" pull >/dev/null 2>&1
+assert_equals 0 $? "wt pull recovers once main/ is back on the remote line"
+
+# A branch that was never pushed cannot pull.
+output=$("$WT" pull pull-feature 2>&1)
+assert_not_equals 0 $? "wt pull fails on a never-pushed branch"
+assert_contains "$output" "never pushed" "pull explains the missing origin branch"
+
+# A pushed branch fast-forwards to its own origin ref.
+git -C "$feature" push -q origin pull-feature
+advance_remote "$TMP/remote-pull.git" feature-advance pull-feature
+feature_tip=$(git --git-dir="$TMP/remote-pull.git" rev-parse refs/heads/pull-feature)
+"$WT" pull pull-feature >/dev/null 2>&1
+assert_equals 0 $? "wt pull works on a named, pushed worktree"
+assert_equals "$feature_tip" "$(git -C "$feature" rev-parse HEAD)" \
+    "named pull fast-forwards to origin/<branch>"
+
+# ============================================================
+# Test Suite: bash completion
+# ============================================================
+test_suite "bash completion"
+
+# Drive _wt exactly as readline would: set COMP_WORDS/COMP_CWORD, collect
+# COMPREPLY. The wt() shim points completion's `wt list --names` at the
+# pullproj layout built above.
+complete_wt() {
+    bash -c '
+        wt() { "'"$WT"'" "$@"; }
+        cd "'"$TMP"'/pullproj" || exit 1
+        source "'"$DOTFILES_DIR"'/shell/completions/wt.bash"
+        COMP_WORDS=("$@"); COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 )); COMPREPLY=()
+        _wt
+        printf "%s\n" "${COMPREPLY[@]}"
+    ' -- "$@"
+}
+
+out=$(complete_wt wt "")
+assert_contains "$out" "pull" "top-level completion offers pull"
+assert_contains "$out" "git" "top-level completion offers git"
+assert_contains "$out" "container" "top-level completion offers container"
+assert_not_contains "$out" "diff-local" "top-level completion drops the absorbed diff-local"
+
+out=$(complete_wt wt container "")
+assert_equals "up exec" "${out//$'\n'/ }" "wt container completes its two subcommands"
+out=$(complete_wt wt container up "")
+assert_contains "$out" "main" "wt container up completes worktree names"
+
+out=$(complete_wt wt sync "")
+assert_contains "$out" "--diff" "wt sync offers --diff"
+assert_contains "$out" "--all" "wt sync offers --all"
+assert_contains "$out" "main" "wt sync offers worktree names"
+
+out=$(complete_wt wt remove main "")
+assert_equals "--branch" "$out" "wt remove past the name offers only the flag"
+
+out=$(complete_wt wt pull "")
+assert_contains "$out" "main" "wt pull completes main"
+assert_contains "$out" "pull-feature" "wt pull completes worktree names"
+
+out=$(complete_wt wt git "")
+assert_contains "$out" "main" "wt git completes worktree names at the name position"
+
+# Past the name, without git's own completion loaded, _wt must stay silent
+# and exit cleanly rather than offering worktree names to git.
+out=$(complete_wt wt git main "")
+status=$?
+assert_equals 0 "$status" "wt git past the name exits cleanly without git completion"
+assert_equals "" "$out" "wt git past the name offers no wt candidates"
 
 # ============================================================
 # Summary

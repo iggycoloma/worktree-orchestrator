@@ -19,7 +19,7 @@ die()  { printf 'wt: error: %s\n' "$*" >&2; exit 1; }
 
 # ------------------------------------------------------------------ help ----
 
-WT_COMMANDS=(init add go list path sync diff-local container-up exec remove prune doctor)
+WT_COMMANDS=(init add go list path pull git sync container remove prune doctor)
 
 # Single source of truth per command: "<synopsis>\t<description>". The
 # command table, per-command --help, and every usage error read from here,
@@ -30,11 +30,11 @@ command_spec() {
         add)          printf '%s\t%s' 'add <name> [base]'        'create a worktree (+ provision local files in orchestration mode)' ;;
         go)           printf '%s\t%s' 'go [name]'                'cd into a worktree (no name: the stable checkout)' ;;
         list)         printf '%s\t%s' 'list [--names]'           'list worktrees for the current project' ;;
-        path)         printf '%s\t%s' 'path <name>'              "print the worktree's path" ;;
-        sync)         printf '%s\t%s' 'sync <name|--all>'        "refresh local/shared into a worktree, 'main', or all (templates untouched)" ;;
-        diff-local)   printf '%s\t%s' 'diff-local <name>'        "show drift between local/shared and a worktree's copies" ;;
-        container-up) printf '%s\t%s' 'container-up <name>'      "start the worktree's dev container (host only)" ;;
-        exec)         printf '%s\t%s' 'exec <name> -- <cmd...>'  "run a command in the worktree's dev container (host only)" ;;
+        path)         printf '%s\t%s' 'path [name]'              "print the worktree's path (default: main)" ;;
+        pull)         printf '%s\t%s' 'pull [name]'              "fetch origin and fast-forward a worktree to origin/<branch> (default: main)" ;;
+        git)          printf '%s\t%s' 'git <name> <git-args...>' 'run git in the named worktree (verbatim pass-through)' ;;
+        sync)         printf '%s\t%s' 'sync [name|--all] [--diff]' "refresh local/shared into a worktree (default: main); --diff previews drift" ;;
+        container)    printf '%s\t%s' 'container up|exec ...'    "manage the worktree's dev container (host only)" ;;
         remove)       printf '%s\t%s' 'remove <name> [--branch]' 'remove a worktree + its containers (refuses dirty)' ;;
         prune)        printf '%s\t%s' 'prune'                    'clean up stale worktree administrative entries' ;;
         doctor)       printf '%s\t%s' 'doctor'                   'check layout, git version, pointers, and tooling' ;;
@@ -70,21 +70,48 @@ NOTE
   completion and scripting.
 NOTE
         ;;
+        path) cat <<'NOTE'
+  <name> may be a worktree name or any unambiguous prefix of one. With no
+  name: main/ in orchestration mode, the repository root in clone mode.
+NOTE
+        ;;
         sync) cat <<'NOTE'
-  <name> may be a worktree name, 'main' (orchestration mode), or an absolute
-  path. --all syncs main plus every registered worktree in one pass.
-  local/shared is overwritten in the worktree; local/template is never touched
-  after the initial copy.
+  <name> may be a worktree name, an unambiguous prefix, or an absolute path;
+  it defaults to main. --all syncs main plus every registered worktree in
+  one pass. local/shared is overwritten in the worktree; local/template is
+  never touched after the initial copy.
+
+  --diff previews instead of copying: one line per missing or differing
+  file, exit 1 on drift, nothing written. Combines with --all.
+NOTE
+        ;;
+        container) cat <<'NOTE'
+  wt container up [name]                start the dev container (default: main)
+  wt container exec <name> -- <cmd...>  run a command in the container
+
+  Everything after -- is passed to the container verbatim, including flags:
+  'wt container exec api -- pytest --help' runs pytest's help, not wt's.
+  Host-only: containers never launch containers. This runs IN the
+  container -- for host-side git in a worktree, use 'wt git'.
+NOTE
+        ;;
+        pull) cat <<'NOTE'
+  Fetches origin (--prune), then fast-forwards the worktree's branch to
+  origin/<branch>. Refuses staged or unstaged changes, and never merges or
+  rebases: a diverged tree is an error to resolve explicitly, not an
+  implicit merge. Keeps the stable main/ checkout pristine by construction.
+NOTE
+        ;;
+        git) cat <<'NOTE'
+  Everything after <name> is passed to git verbatim, including flags:
+  'wt git main log --help' shows git's help, not wt's. Equivalent to
+  git -C "$(wt path <name>)" <git-args...>, with no wt policy applied --
+  'wt git main pull' bypasses the fast-forward guard that 'wt pull' adds.
 NOTE
         ;;
         remove) cat <<'NOTE'
   Refuses to run when the worktree has staged, unstaged, or untracked changes.
   --branch also deletes the worktree's branch.
-NOTE
-        ;;
-        exec) cat <<'NOTE'
-  Everything after -- is passed to the container verbatim, including flags:
-  'wt exec api -- pytest --help' runs pytest's help, not wt's.
 NOTE
         ;;
     esac
@@ -104,7 +131,7 @@ usage() {
         printf 'Usage: wt <command> [args]\n\n'
         for cmd in "${WT_COMMANDS[@]}"; do
             spec="$(command_spec "$cmd")"
-            printf '  %-26s%s\n' "${spec%%$'\t'*}" "${spec#*$'\t'}"
+            printf '  %-28s%s\n' "${spec%%$'\t'*}" "${spec#*$'\t'}"
         done
         printf "\nRun 'wt <command> --help' for detail on one command."
     )"
@@ -516,12 +543,38 @@ dotfiles_repo() {
     fi
 }
 
+# Target when no name is given: the stable checkout -- main/ in
+# orchestration mode, the repository root in clone mode. Call after
+# detect_mode.
+default_worktree() {
+    if [[ "$WT_MODE" == "orchestration" && -d "$WT_ROOT/main" ]]; then
+        printf '%s\n' "$WT_ROOT/main"
+    else
+        printf '%s\n' "$WT_ROOT"
+    fi
+}
+
+# Shared "[name] defaults to main" resolution for the commands whose name
+# is optional. Commands where the name is structurally required (add, git,
+# container exec, remove) never call this.
+resolve_or_default() {
+    if [[ -n "${1:-}" ]]; then resolve_worktree "$1"; else default_worktree; fi
+}
+
+cmd_container() {
+    local sub="${1:-}"
+    case "$sub" in
+        up)   shift; cmd_container_up "$@" ;;
+        exec) shift; cmd_container_exec "$@" ;;
+        *)    die "usage: $(command_synopsis container)" ;;
+    esac
+}
+
 cmd_container_up() {
-    check_args container-up 1 1 "$@"
-    local name="$1"
+    check_args container 0 1 "$@"
     detect_mode
     local dest slug repo
-    dest="$(resolve_worktree "$name")"
+    dest="$(resolve_or_default "${1:-}")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
     require_host_docker
     slug="$(basename "$dest")"
@@ -534,12 +587,16 @@ cmd_container_up() {
     devcontainer up "${flags[@]}"
 }
 
-cmd_exec() {
+cmd_container_exec() {
     local name="${1:-}"
-    require_name exec "$name"
+    require_name container "$name"
     shift
-    [[ "${1:-}" == "--" ]] && shift
-    [[ $# -gt 0 ]] || die "usage: $(command_synopsis exec)"
+    # The separator is mandatory: it is what keeps the container command's
+    # flags out of wt's own parsing, so its absence is a usage error rather
+    # than a guess.
+    [[ "${1:-}" == "--" ]] || die "usage: $(command_synopsis container)"
+    shift
+    [[ $# -gt 0 ]] || die "usage: $(command_synopsis container)"
     detect_mode
     local dest slug
     dest="$(resolve_worktree "$name")"
@@ -643,6 +700,12 @@ cmd_add() {
         # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
         git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG "$dest" "$branch" >&2
     else
+        # New branches start at the true remote head, not the head as of
+        # the last fetch. Best-effort: an offline add still works.
+        if git --git-dir="$WT_GIT_DIR" config remote.origin.url >/dev/null 2>&1; then
+            git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin 2>/dev/null \
+                || log "warning: fetch failed; basing '$branch' on last-known origin state"
+        fi
         [[ -n "$base" ]] || base="$(default_base "$WT_GIT_DIR")"
         # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
         git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG -b "$branch" "$dest" "$base" >&2
@@ -686,36 +749,113 @@ cmd_list() {
 
 cmd_go() {
     check_args go 0 1 "$@"
+    cmd_path "$@"
+}
+
+cmd_path() {
+    check_args path 0 1 "$@"
     detect_mode
     local dest
-    if [[ $# -eq 0 ]]; then
-        dest="$WT_ROOT"
-        [[ "$WT_MODE" != "orchestration" || ! -d "$WT_ROOT/main" ]] || dest="$WT_ROOT/main"
-    else
-        dest="$(resolve_worktree "$1")"
-    fi
+    dest="$(resolve_or_default "${1:-}")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
     printf '%s\n' "$dest"
 }
 
-cmd_path() {
-    check_args path 1 1 "$@"
-    local name="$1"
+cmd_pull() {
+    check_args pull 0 1 "$@"
+    detect_mode
+    local dest
+    dest="$(resolve_or_default "${1:-}")"
+    [[ -d "$dest" ]] || die "no such worktree: $dest"
+
+    local branch
+    branch="$(git -C "$dest" symbolic-ref --short HEAD 2>/dev/null || true)"
+    [[ -n "$branch" ]] || die "cannot pull: detached HEAD in $dest"
+
+    # Fast-forward only, and never over local edits: main/ must stay
+    # pristine, and a diverged branch needs an explicit rebase decision,
+    # not an implicit merge. Untracked files are left to git, which
+    # aborts by itself on a collision.
+    git -C "$dest" diff --quiet || die "worktree has unstaged changes: $dest"
+    git -C "$dest" diff --cached --quiet || die "worktree has staged changes: $dest"
+
+    git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin || die "fetch failed"
+    git --git-dir="$WT_GIT_DIR" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null \
+        || die "no origin/$branch to pull (branch never pushed?)"
+    git -C "$dest" merge --ff-only "origin/$branch" >&2 \
+        || die "cannot fast-forward: $dest has commits not on origin/$branch"
+    log "pulled $dest ($branch -> origin/$branch)"
+}
+
+cmd_git() {
+    local name="${1:-}"
+    require_name git "$name"
+    shift
     detect_mode
     local dest
     dest="$(resolve_worktree "$name")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
-    printf '%s\n' "$dest"
+    exec git -C "$dest" "$@"
+}
+
+# Compare one worktree's copies against local/shared: one line per missing
+# or differing file, return 1 on drift. $2 (optional) prefixes each line so
+# --all output stays attributable per tree.
+diff_local_tree() {
+    local dest="$1" prefix="${2:-}" shared src rel drift=0
+    shared="$WT_ROOT/local/shared"
+    [[ -d "$shared" ]] || { log "no local/shared to compare"; return 0; }
+    while IFS= read -r -d '' src; do
+        rel="${src#"$shared"/}"
+        if [[ ! -f "$dest/$rel" ]]; then
+            printf '%smissing\t%s\n' "$prefix" "$rel"
+            drift=1
+        elif ! cmp -s "$src" "$dest/$rel"; then
+            printf '%sdiffers\t%s\n' "$prefix" "$rel"
+            drift=1
+        fi
+    done < <(find "$shared" -type f -print0)
+    return "$drift"
 }
 
 cmd_sync() {
-    [[ $# -eq 1 ]] || die "usage: $(command_synopsis sync)"
-    local name="$1"
-    [[ "$name" == "--all" ]] || require_name sync "$name"
+    local name="" all=0 diff=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --all)  all=1 ;;
+            --diff) diff=1 ;;
+            -*) die "unknown option: $arg (see 'wt sync --help')" ;;
+            *)  [[ -z "$name" ]] || die "usage: $(command_synopsis sync)"; name="$arg" ;;
+        esac
+    done
+    [[ "$all" -eq 0 || -z "$name" ]] || die "usage: $(command_synopsis sync)"
     detect_mode
     [[ "$WT_MODE" == "orchestration" ]] || die "sync requires an orchestration dir (clone mode has no local/ source)"
 
-    if [[ "$name" == "--all" ]]; then
+    if [[ "$diff" -eq 1 ]]; then
+        local drift=0
+        if [[ "$all" -eq 1 ]]; then
+            local wt_path
+            while IFS= read -r wt_path; do
+                [[ -d "$wt_path" ]] || continue
+                diff_local_tree "$wt_path" "$(basename "$wt_path")"$'\t' || drift=1
+            done < <(registered_worktrees)
+        else
+            local dest
+            dest="$(resolve_or_default "$name")"
+            [[ -d "$dest" ]] || die "no such worktree: $dest"
+            diff_local_tree "$dest" || drift=1
+        fi
+        if [[ "$drift" -eq 0 ]]; then
+            log "no drift: worktree copies match local/shared"
+        else
+            log "drift found; rerun without --diff to refresh (worktree copies are overwritten)"
+            return 1
+        fi
+        return 0
+    fi
+
+    if [[ "$all" -eq 1 ]]; then
         # Every registered worktree: main/ plus everything under wt/.
         local wt_path failures=0
         while IFS= read -r wt_path; do
@@ -734,40 +874,12 @@ cmd_sync() {
     fi
 
     local dest
-    dest="$(resolve_worktree "$name")"
+    dest="$(resolve_or_default "$name")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
     provision_local_files "$WT_ROOT" "$dest" || die "sync failed validation; nothing copied"
     log "synced local/ into $dest"
     write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")"
     run_hook post-sync "$WT_ROOT" "$dest"
-}
-
-cmd_diff_local() {
-    check_args diff-local 1 1 "$@"
-    local name="$1"
-    detect_mode
-    [[ "$WT_MODE" == "orchestration" ]] || die "diff-local requires an orchestration dir"
-    local dest shared src rel drift=0
-    dest="$(resolve_worktree "$name")"
-    [[ -d "$dest" ]] || die "no such worktree: $dest"
-    shared="$WT_ROOT/local/shared"
-    [[ -d "$shared" ]] || { log "no local/shared to compare"; return 0; }
-    while IFS= read -r -d '' src; do
-        rel="${src#"$shared"/}"
-        if [[ ! -f "$dest/$rel" ]]; then
-            printf 'missing\t%s\n' "$rel"
-            drift=1
-        elif ! cmp -s "$src" "$dest/$rel"; then
-            printf 'differs\t%s\n' "$rel"
-            drift=1
-        fi
-    done < <(find "$shared" -type f -print0)
-    if [[ "$drift" -eq 0 ]]; then
-        log "no drift: worktree matches local/shared"
-    else
-        log "drift found; run 'wt sync $name' to refresh (worktree copies are overwritten)"
-        return 1
-    fi
 }
 
 cmd_remove() {
@@ -911,13 +1023,19 @@ command_spec "$command_name" >/dev/null || die "unknown command: $command_name (
 
 # A help flag must print help, never run the command: 'wt add --help' used to
 # reach cmd_add and create a worktree named 'help'. Scanning stops at '--' so
-# 'wt exec x -- tool --help' still reaches the tool.
-for help_arg in "$@"; do
-    case "$help_arg" in
-        --) break ;;
-        -h|--help) command_help "$command_name" ;;
-    esac
-done
+# 'wt container exec x -- tool --help' still reaches the tool. For 'git',
+# everything after the name belongs to git verbatim ('wt git main log --help'
+# means git's help), so only the name position is scanned.
+if [[ "$command_name" == "git" ]]; then
+    case "${1:-}" in -h|--help) command_help git ;; esac
+else
+    for help_arg in "$@"; do
+        case "$help_arg" in
+            --) break ;;
+            -h|--help) command_help "$command_name" ;;
+        esac
+    done
+fi
 
 case "$command_name" in
     init)         cmd_init "$@" ;;
@@ -925,10 +1043,10 @@ case "$command_name" in
     go)           cmd_go "$@" ;;
     list)         cmd_list "$@" ;;
     path)         cmd_path "$@" ;;
+    pull)         cmd_pull "$@" ;;
+    git)          cmd_git "$@" ;;
     sync)         cmd_sync "$@" ;;
-    diff-local)   cmd_diff_local "$@" ;;
-    container-up) cmd_container_up "$@" ;;
-    exec)         cmd_exec "$@" ;;
+    container)    cmd_container "$@" ;;
     remove)       cmd_remove "$@" ;;
     prune)        cmd_prune "$@" ;;
     doctor)       cmd_doctor "$@" ;;

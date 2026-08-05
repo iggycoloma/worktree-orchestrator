@@ -24,11 +24,11 @@ _wt() {
         'add:create a worktree'
         'go:cd into a worktree'
         'list:list worktrees for the current project'
-        'path:print the worktree'\''s path'
-        'sync:refresh local/shared into a worktree'
-        'diff-local:show drift between local/shared and a worktree'\''s copies'
-        'container-up:start the worktree'\''s dev container'
-        'exec:run a command in the worktree'\''s dev container'
+        'path:print the worktree'\''s path (default: main)'
+        'pull:fetch origin and fast-forward a worktree (default: main)'
+        'git:run git in the named worktree (verbatim pass-through)'
+        'sync:refresh local/shared into a worktree (default: main)'
+        'container:manage the worktree'\''s dev container (host only)'
         'remove:remove a worktree + its containers'
         'prune:clean up stale worktree administrative entries'
         'doctor:check layout, git version, pointers, and tooling'
@@ -41,18 +41,45 @@ _wt() {
     fi
 
     case "${words[2]}" in
-        go|path|diff-local|container-up|exec)
+        go|path|pull)
             (( CURRENT == 3 )) && _wt_worktrees ;;
-        sync)
+        git)
             if (( CURRENT == 3 )); then
-                _alternative 'flags:flag:((--all:"sync main plus every worktree"))' \
-                    'worktrees:worktree:_wt_worktrees'
+                _wt_worktrees
+            else
+                # Past the name, re-dispatch as a plain git command line so
+                # subcommands, flags, and refs complete as after 'git '.
+                # Refs are shared repo-wide, so cwd context is correct.
+                words=( git "${(@)words[4,-1]}" )
+                (( CURRENT -= 2 ))
+                _normal
             fi ;;
-        remove)
-            _alternative 'flags:flag:((--branch:"also delete the branch"))' \
+        container)
+            # up|exec, then the name; past that the words belong to the
+            # container command.
+            if (( CURRENT == 3 )); then
+                _values 'container command' \
+                    'up[start the dev container (default: main)]' \
+                    'exec[run a command in the container]'
+            elif (( CURRENT == 4 )); then
+                _wt_worktrees
+            fi ;;
+        sync)
+            # Name and flags are order-free; offer whichever remain.
+            _alternative \
+                'flags:flag:((--all:"sync main plus every worktree" --diff:"preview drift without copying"))' \
                 'worktrees:worktree:_wt_worktrees' ;;
+        remove)
+            if (( CURRENT == 3 )); then
+                _alternative 'flags:flag:((--branch:"also delete the branch"))' \
+                    'worktrees:worktree:_wt_worktrees'
+            else
+                _values 'flag' '--branch[also delete the branch]'
+            fi ;;
         list)
             _values 'flag' '--names[print bare directory names, one per line]' ;;
+        init)
+            (( CURRENT == 4 )) && _files -/ ;;
         add)
             (( CURRENT == 4 )) && _wt_refs ;;
         help)
