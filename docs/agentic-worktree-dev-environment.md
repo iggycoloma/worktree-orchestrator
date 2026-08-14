@@ -92,6 +92,43 @@ Git worktrees share repository data while retaining separate per-worktree files 
 
 This avoids nesting agent worktrees inside the main checkout, which can confuse recursive searches, Docker build contexts, file watchers, editor indexing, and scripts that assume the repository does not contain complete copies of itself.
 
+### Why the orchestration root needs an `.ignore`
+
+Every directory under `wt/` is a full checkout, so the file count below the orchestration root grows linearly with worktree count.
+Nothing bounds a search descending from here: `.gitignore` only applies inside a repository, and the orchestration directory is deliberately not one.
+A tool that walks down from the root therefore enumerates every worktree in full.
+
+This matters beyond wasted time.
+A glob is expanded before the command runs, so `cmd wt/*/src/*.ts` reaches `cmd` as the literal path of every match.
+Arguments and environment share a per-`execve` budget of roughly 2 MB, which puts a hard ceiling on how many worktrees can exist before ordinary commands start failing with `E2BIG` ("argument list too long").
+The ceiling is content-proportional -- budget divided by bytes per checkout -- so it lands somewhere in the single digits to low teens for a substantial repository, and moves whenever the tree grows.
+
+`wt init` writes an `.ignore` at the orchestration root, `wt doctor` reports it missing or stale, and `wt ignore [path]` regenerates one anywhere.
+
+One file per orchestration directory is sufficient, including for a session rooted further up.
+Ripgrep reads ignore files at every directory level as it descends, so a search started at a workspace root picks up each project's file on entering that project and prunes `wt/` before walking into it:
+
+```text
+~/Projects/
+├── example-project/
+│   └── .ignore             # wt/ -- prunes this project's worktrees
+└── other-project/
+    └── .ignore             # likewise, read on descent from ~/Projects
+```
+
+Measured on a workspace holding two orchestration directories with three worktrees between them: 105 files visible with no ignore files present, 45 with only the two per-project ones -- exactly the non-worktree content.
+
+A file at the workspace root is therefore optional, and duplicating the per-project patterns there buys nothing.
+It earns a place only as a catch-all for what per-project files cannot cover: repositories never initialized by `wt`, whose native `.claude/worktrees/` nothing excludes, and vault machinery such as `.obsidian/`.
+Both are constant in size rather than growing with worktree count, so they are hygiene rather than the failure described above.
+
+The file is honored by `rg` and `fd`, and therefore by agent tooling built on them.
+It bounds only *descent from above*: ripgrep never filters its own search root or a path named explicitly on the command line, so a search run from inside `wt/feat-1/`, or one targeting it directly, still works normally.
+Content outside the generated block is preserved, so hand-written rules survive regeneration.
+
+Shell pathname expansion honors no ignore file at all.
+That gap has no configuration-level fix, so it is covered by convention instead -- see the glob rule in `agent-prompts/engineering-conventions.md`.
+
 ### Why keep a populated `main/` worktree?
 
 The stable checkout is useful for:

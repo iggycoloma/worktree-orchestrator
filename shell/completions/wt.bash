@@ -20,7 +20,7 @@ _wt() {
     cmd="${COMP_WORDS[1]:-}"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
-        candidates="init add go list path pull git sync container remove prune doctor help"
+        candidates="init add go list path pull git sync container remove prune ignore doctor help"
     else
         case "$cmd" in
             go|path|pull)
@@ -67,6 +67,15 @@ _wt() {
                 fi ;;
             list)
                 candidates="--names" ;;
+            ignore)
+                # Target is any workspace directory, not a worktree name.
+                if [[ "$cur" == -* ]]; then
+                    candidates="--print"
+                else
+                    # shellcheck disable=SC2207
+                    COMPREPLY=( $(compgen -d -- "$cur") )
+                    return 0
+                fi ;;
             init)
                 # <url> has nothing to offer; <dir> completes directories.
                 [[ "$COMP_CWORD" -eq 3 ]] || return 0
@@ -78,7 +87,7 @@ _wt() {
                 [[ "$COMP_CWORD" -eq 3 ]] || return 0
                 candidates="$(_wt_branches)" ;;
             help)
-                candidates="init add go list path pull git sync container remove prune doctor" ;;
+                candidates="init add go list path pull git sync container remove prune ignore doctor" ;;
             *)
                 return 0 ;;
         esac

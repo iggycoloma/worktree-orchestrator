@@ -31,6 +31,7 @@ _wt() {
         'container:manage the worktree'\''s dev container (host only)'
         'remove:remove a worktree + its containers'
         'prune:clean up stale worktree administrative entries'
+        'ignore:write a workspace .ignore so searches skip worktrees'
         'doctor:check layout, git version, pointers, and tooling'
         'help:show help for a command'
     )
@@ -78,6 +79,11 @@ _wt() {
             fi ;;
         list)
             _values 'flag' '--names[print bare directory names, one per line]' ;;
+        ignore)
+            # Target is any workspace directory, not a worktree name.
+            _alternative \
+                'flags:flag:((--print:"write to stdout instead of the file"))' \
+                'dirs:directory:_files -/' ;;
         init)
             (( CURRENT == 4 )) && _files -/ ;;
         add)

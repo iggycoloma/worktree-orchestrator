@@ -523,6 +523,50 @@ assert_contains "$output" "config remote.origin.fetch" "doctor prints the repair
 git --git-dir="$TMP/proj/repo.git" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
 
 # ============================================================
+# Test Suite: ignore generation
+# ============================================================
+test_suite "ignore"
+
+# init must leave a bounded .ignore behind: an orchestration dir is not a
+# repository, so nothing else stops a search descending into every worktree.
+assert_file_exists "$TMP/proj/.ignore" "init writes .ignore at the orchestration root"
+assert_contains "$(cat "$TMP/proj/.ignore")" "wt/" ".ignore excludes the worktree dir"
+output=$(cd "$TMP/proj" && "$WT" doctor 2>&1)
+assert_contains "$output" ".ignore: current" "doctor accepts the generated .ignore"
+
+# Detection is by layout, not by a fixed list: a workspace above several
+# orchestration dirs gets a pattern per project.
+IGN="$TMP/ws"
+mkdir -p "$IGN/a/repo.git" "$IGN/a/wt/one" "$IGN/b/repo.git" "$IGN/b/wt/two" "$IGN/solo-worktrees/x"
+output=$("$WT" ignore --print "$IGN")
+assert_contains "$output" "a/wt/" "ignore detects the first orchestration dir"
+assert_contains "$output" "b/wt/" "ignore detects the second orchestration dir"
+assert_contains "$output" "solo-worktrees/" "ignore detects a clone-mode sibling tree"
+assert_contains "$output" '**/.claude/worktrees/' "ignore always covers native Claude Code worktrees"
+assert_file_not_exists "$IGN/.ignore" "--print writes nothing to disk"
+
+# A dir with repo.git but no wt/ is not a worktree host and must not match.
+mkdir -p "$IGN/bare-only/repo.git"
+output=$("$WT" ignore --print "$IGN")
+assert_not_contains "$output" "bare-only/" "ignore skips a bare repo with no wt/ dir"
+
+# Regeneration is idempotent and preserves hand-written rules outside the block.
+printf '# handwritten\nscratch/\n' > "$IGN/.ignore"
+"$WT" ignore "$IGN" >/dev/null 2>&1
+"$WT" ignore "$IGN" >/dev/null 2>&1
+assert_contains "$(cat "$IGN/.ignore")" "scratch/" "regeneration preserves user rules"
+assert_equals 1 "$(grep -c 'wt ignore >>>' "$IGN/.ignore")" "regeneration leaves exactly one managed block"
+
+# Vault machinery is emitted only where a vault exists.
+assert_not_contains "$("$WT" ignore --print "$IGN")" ".obsidian/" "no vault patterns without a vault"
+mkdir -p "$IGN/vault/.obsidian"
+assert_contains "$("$WT" ignore --print "$IGN")" ".obsidian/" "vault machinery emitted when a vault is present"
+
+output=$("$WT" ignore "$TMP/does-not-exist" 2>&1)
+assert_not_equals 0 $? "ignore rejects a missing directory"
+assert_contains "$output" "not a directory" "ignore names the missing directory"
+
+# ============================================================
 # Test Suite: post-checkout safety-net hook
 # ============================================================
 test_suite "post-checkout hook"
