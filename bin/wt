@@ -14,12 +14,71 @@ set -euo pipefail
 # now -- split into bootstrap/lib/wt/ when the devcontainer/compose commands
 # land (Phase 5).
 
-log()  { printf 'wt: %s\n' "$*" >&2; }
-die()  { printf 'wt: error: %s\n' "$*" >&2; exit 1; }
+WT_VERSION='1.1.0'
+
+# Every message, usage string, and fix-it hint reads from this, so a renamed
+# executable or a symlink under another name does not tell the user to run a
+# command they do not have. Sourcing (tests) leaves $0 pointing at the caller,
+# hence the fallback. The .ignore managed-block markers deliberately do NOT
+# use it -- see WT_IGNORE_BEGIN.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    WT_NAME="${WT_NAME:-${0##*/}}"
+else
+    WT_NAME="${WT_NAME:-wt}"
+fi
+# Substituted into help text with sed, so anything outside this set would let
+# a hostile argv0 rewrite the notes rather than just name the command.
+case "$WT_NAME" in ''|*[!A-Za-z0-9._-]*) WT_NAME='wt' ;; esac
+
+log()  { printf '%s: %s\n' "$WT_NAME" "$*" >&2; }
+die()  { printf '%s: error: %s\n' "$WT_NAME" "$*" >&2; exit 1; }
+
+# Escapes what actually turns up in this tool's JSON -- paths, branch names,
+# and log lines. jq would be a better escaper but is not a dependency here,
+# and the packages layer does not guarantee it on every platform wt runs on.
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    # Every remaining control byte is illegal raw inside a JSON string and has
+    # no short escape, so it has to go out as \u00XX. A filesystem path may
+    # legally contain one, and paths are the main thing these commands emit.
+    # Guarded by the case: the scan is per character, and almost no string
+    # reaching here has any.
+    case "$s" in
+        *[[:cntrl:]]*)
+            local out="" i c
+            for (( i = 0; i < ${#s}; i++ )); do
+                c="${s:i:1}"
+                case "$c" in
+                    [[:cntrl:]]) printf -v c '\\u%04x' "'$c" ;;
+                esac
+                out+="$c"
+            done
+            s="$out"
+            ;;
+    esac
+    printf '%s' "$s"
+}
+
+# readlink -f is GNU-only; BSD readlink resolves one level and has no -f, so
+# the loop is what keeps `version` honest about its origin on macOS.
+wt_realpath() {
+    local p="$1" d
+    while [[ -L "$p" ]]; do
+        d="$(cd -P "$(dirname "$p")" && pwd)"
+        p="$(readlink "$p")"
+        case "$p" in /*) ;; *) p="$d/$p" ;; esac
+    done
+    printf '%s/%s\n' "$(cd -P "$(dirname "$p")" && pwd)" "$(basename "$p")"
+}
 
 # ------------------------------------------------------------------ help ----
 
-WT_COMMANDS=(init add go list path pull git sync container remove prune ignore doctor)
+WT_COMMANDS=(init add go list path pull git sync container remove prune ignore doctor version)
 
 # Single source of truth per command: "<synopsis>\t<description>". The
 # command table, per-command --help, and every usage error read from here,
@@ -27,9 +86,9 @@ WT_COMMANDS=(init add go list path pull git sync container remove prune ignore d
 command_spec() {
     case "$1" in
         init)         printf '%s\t%s' 'init <url> <dir>'         'create an orchestration dir (bare clone + local/ state/ main/ wt/)' ;;
-        add)          printf '%s\t%s' 'add <name> [base]'        'create a worktree (+ provision local files in orchestration mode)' ;;
+        add)          printf '%s\t%s' 'add <name|pr:N> [base]'   'create a worktree (+ provision local files in orchestration mode)' ;;
         go)           printf '%s\t%s' 'go [name]'                'cd into a worktree (no name: the stable checkout)' ;;
-        list)         printf '%s\t%s' 'list [--names]'           'list worktrees for the current project' ;;
+        list)         printf '%s\t%s' 'list [--names|--json]'    'list worktrees for the current project' ;;
         path)         printf '%s\t%s' 'path [name]'              "print the worktree's path (default: main)" ;;
         pull)         printf '%s\t%s' 'pull [name]'              "fetch origin and fast-forward a worktree to origin/<branch> (default: main)" ;;
         git)          printf '%s\t%s' 'git <name> <git-args...>' 'run git in the named worktree (verbatim pass-through)' ;;
@@ -38,7 +97,8 @@ command_spec() {
         remove)       printf '%s\t%s' 'remove <name> [--branch]' 'remove a worktree + its containers (refuses dirty)' ;;
         prune)        printf '%s\t%s' 'prune'                    'clean up stale worktree administrative entries' ;;
         ignore)       printf '%s\t%s' 'ignore [--print] [path]'  'write a workspace .ignore so searches skip worktrees (default: .)' ;;
-        doctor)       printf '%s\t%s' 'doctor'                   'check layout, git version, pointers, and tooling' ;;
+        doctor)       printf '%s\t%s' 'doctor [--json]'          'check layout, git version, pointers, and tooling' ;;
+        version)      printf '%s\t%s' 'version [--json]'         'print the version and where this executable came from' ;;
         *) return 1 ;;
     esac
 }
@@ -46,15 +106,30 @@ command_spec() {
 command_synopsis() {
     local spec
     spec="$(command_spec "$1")" || return 1
-    printf 'wt %s\n' "${spec%%$'\t'*}"
+    printf '%s %s\n' "$WT_NAME" "${spec%%$'\t'*}"
 }
 
+# Notes are written with @WT@ where the command name belongs: the heredocs are
+# quoted so that examples containing $(...) stay literal rather than executing,
+# which rules out interpolating the name directly.
 command_notes() {
+    command_notes_raw "$1" | sed "s/@WT@/$WT_NAME/g"
+}
+
+command_notes_raw() {
     case "$1" in
         add) cat <<'NOTE'
   <name> doubles as the branch name when it is a legal ref (e.g. user/CLK-943);
   otherwise the branch is the slugified name. [base] defaults to origin's
   default branch, and is used only when the branch does not already exist.
+
+  pr:123 and mr:123 are synonyms: both resolve the request's source branch
+  through gh or glab, whichever the origin remote calls for, and base the new
+  worktree on that branch rather than on the default one. Set WT_FORGE to
+  github or gitlab for a self-hosted host that names neither vendor.
+
+  --json prints the created worktree's path, branch, mode and port block as
+  one object instead of the bare path.
 NOTE
         ;;
         go) cat <<'NOTE'
@@ -63,7 +138,7 @@ NOTE
   orchestration mode, the repository root in clone mode.
 
   Only the shell function changes directory; the binary prints the path,
-  which is what makes `cd "$(wt go x)"` work from scripts.
+  which is what makes `cd "$(@WT@ go x)"` work from scripts.
 NOTE
         ;;
         list) cat <<'NOTE'
@@ -87,13 +162,13 @@ NOTE
 NOTE
         ;;
         container) cat <<'NOTE'
-  wt container up [name]                start the dev container (default: main)
-  wt container exec <name> -- <cmd...>  run a command in the container
+  @WT@ container up [name]                start the dev container (default: main)
+  @WT@ container exec <name> -- <cmd...>  run a command in the container
 
   Everything after -- is passed to the container verbatim, including flags:
-  'wt container exec api -- pytest --help' runs pytest's help, not wt's.
+  '@WT@ container exec api -- pytest --help' runs pytest's help, not @WT@'s.
   Host-only: containers never launch containers. This runs IN the
-  container -- for host-side git in a worktree, use 'wt git'.
+  container -- for host-side git in a worktree, use '@WT@ git'.
 NOTE
         ;;
         pull) cat <<'NOTE'
@@ -105,9 +180,9 @@ NOTE
         ;;
         git) cat <<'NOTE'
   Everything after <name> is passed to git verbatim, including flags:
-  'wt git main log --help' shows git's help, not wt's. Equivalent to
-  git -C "$(wt path <name>)" <git-args...>, with no wt policy applied --
-  'wt git main pull' bypasses the fast-forward guard that 'wt pull' adds.
+  '@WT@ git main log --help' shows git's help, not @WT@'s. Equivalent to
+  git -C "$(@WT@ path <name>)" <git-args...>, with no @WT@ policy applied --
+  '@WT@ git main pull' bypasses the fast-forward guard that '@WT@ pull' adds.
 NOTE
         ;;
         remove) cat <<'NOTE'
@@ -129,21 +204,21 @@ emit() {
 usage() {
     local status="${1:-2}" cmd spec
     emit "$status" "$(
-        printf 'Usage: wt <command> [args]\n\n'
+        printf 'Usage: %s <command> [args]\n\n' "$WT_NAME"
         for cmd in "${WT_COMMANDS[@]}"; do
             spec="$(command_spec "$cmd")"
             printf '  %-28s%s\n' "${spec%%$'\t'*}" "${spec#*$'\t'}"
         done
-        printf "\nRun 'wt <command> --help' for detail on one command."
+        printf "\nRun '%s <command> --help' for detail on one command." "$WT_NAME"
     )"
 }
 
 command_help() {
     local cmd="$1" spec notes
-    spec="$(command_spec "$cmd")" || die "unknown command: $cmd (see 'wt --help')"
+    spec="$(command_spec "$cmd")" || die "unknown command: $cmd (see '$WT_NAME --help')"
     notes="$(command_notes "$cmd")"
     emit 0 "$(
-        printf 'Usage: wt %s\n\n  %s\n' "${spec%%$'\t'*}" "${spec#*$'\t'}"
+        printf 'Usage: %s %s\n\n  %s\n' "$WT_NAME" "${spec%%$'\t'*}" "${spec#*$'\t'}"
         [[ -n "$notes" ]] && printf '\n%s\n' "$notes"
     )"
 }
@@ -156,7 +231,7 @@ command_help() {
 require_name() {
     local cmd="$1" name="${2:-}"
     [[ -n "$name" ]] || die "usage: $(command_synopsis "$cmd")"
-    case "$name" in -*) die "unknown option: $name (see 'wt $cmd --help')" ;; esac
+    case "$name" in -*) die "unknown option: $name (see '$WT_NAME $cmd --help')" ;; esac
 }
 
 # Arity and stray-flag guard for the fully positional commands.
@@ -165,7 +240,7 @@ check_args() {
     shift 3
     [[ $# -ge "$min" && $# -le "$max" ]] || die "usage: $(command_synopsis "$cmd")"
     for arg in "$@"; do
-        case "$arg" in -*) die "unknown option: $arg (see 'wt $cmd --help')" ;; esac
+        case "$arg" in -*) die "unknown option: $arg (see '$WT_NAME $cmd --help')" ;; esac
     done
 }
 
@@ -283,9 +358,15 @@ worktree_dest() {
 # Every worktree path git has registered for this project, minus the bare
 # repo itself (listed in orchestration mode, but it has no working tree).
 registered_worktrees() {
-    local path
+    local path gitdir
+    # git reports worktree paths with symlinks resolved. A WT_GIT_DIR that
+    # reached us through a symlinked parent therefore never string-matches,
+    # and the bare repo leaks through to every caller -- sync --all would
+    # provision into it. Compare the resolved form as well as the literal one.
+    gitdir="$(cd -P "$WT_GIT_DIR" 2>/dev/null && pwd)" || gitdir="$WT_GIT_DIR"
     while IFS= read -r path; do
-        [[ -n "$path" && "$path" != "$WT_GIT_DIR" ]] || continue
+        [[ -n "$path" ]] || continue
+        [[ "$path" != "$WT_GIT_DIR" && "$path" != "$gitdir" ]] || continue
         printf '%s\n' "$path"
     done < <(git --git-dir="$WT_GIT_DIR" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
 }
@@ -358,39 +439,158 @@ validate_local_tree() {
     done < <(find "$source_dir" -type f -print0)
 }
 
+# local/link is the third provisioning mode: shared/ overwrites on content
+# change, template/ is copied once and then left alone, link/ is symlinked so
+# one edit reaches every worktree. All three answer to the same gitignore
+# validation, because the risk they carry is identical.
+provision_link_tree() {
+    local source_dir="$1" worktree="$2" src rel dst
+    [[ -d "$source_dir" ]] || return 0
+    while IFS= read -r -d '' src; do
+        rel="${src#"$source_dir"/}"
+        dst="$worktree/$rel"
+        mkdir -p "$(dirname "$dst")" || return 1
+        # -n so an existing link is replaced rather than followed into its
+        # own target directory.
+        ln -sfn "$src" "$dst" || return 1
+    done < <(find "$source_dir" -type f -print0)
+}
+
 provision_local_files() {
     local root="$1" worktree="$2"
-    local shared="$root/local/shared" template="$root/local/template"
-    [[ -d "$shared" || -d "$template" ]] || return 0
+    local shared="$root/local/shared" template="$root/local/template" link="$root/local/link"
+    [[ -d "$shared" || -d "$template" || -d "$link" ]] || return 0
     validate_local_tree "$shared" "$worktree" || return 1
     validate_local_tree "$template" "$worktree" || return 1
+    validate_local_tree "$link" "$worktree" || return 1
+    # Fatal, not a warning: returning 0 here reported a successful `add` for a
+    # worktree that never received local/, which on a fresh machine looks
+    # ready and is not. Provisioning was requested by the layout, so failing to
+    # provision is a failure of the command.
     if ! command -v rsync >/dev/null 2>&1; then
-        log "warning: rsync not found; skipping local file provisioning"
-        return 0
+        log "rsync not found; cannot provision local/ (install rsync)"
+        return 1
     fi
     # No --delete: never remove worktree-local ignored state.
     # --checksum: the quick check (size+mtime, 1s granularity) misses
     # same-size edits made within a second of the copy; shared/'s contract
     # is overwrite-on-content-change, so compare content.
-    [[ -d "$shared" ]] && rsync -a --checksum --exclude='.DS_Store' "$shared/" "$worktree/"
-    [[ -d "$template" ]] && rsync -a --ignore-existing --exclude='.DS_Store' "$template/" "$worktree/"
+    # Each copy propagates its own failure. errexit is disabled inside a
+    # function evaluated as a condition, and every caller here runs this under
+    # `if ! ...`, so a failed rsync would otherwise fall through to the
+    # `return 0` below and report a partially provisioned worktree as good.
+    if [[ -d "$shared" ]]; then
+        rsync -a --checksum --exclude='.DS_Store' "$shared/" "$worktree/" || return 1
+    fi
+    if [[ -d "$template" ]]; then
+        rsync -a --ignore-existing --exclude='.DS_Store' "$template/" "$worktree/" || return 1
+    fi
+    provision_link_tree "$link" "$worktree" || return 1
+    return 0
+}
+
+# Copies build caches from the stable checkout so a new worktree does not pay
+# a cold dependency install -- the dominant cost of creating one.
+#
+# Copy is the default and link is opt-in, because a symlinked node_modules or
+# target/ is shared mutable state: two worktrees building at once corrupt each
+# other's cache. Link is only right for read-mostly caches.
+#
+# Only fills a path the worktree does not already have, so a sync never
+# clobbers a cache the worktree has since built for itself.
+share_build_caches() {
+    local root="$1" worktree="$2" conf="$3"
+    local paths mode stable entry src dst probe
+    paths="$(read_conf "$conf" CACHE_PATHS "")"
+    [[ -n "$paths" ]] || return 0
+    mode="$(read_conf "$conf" CACHE_MODE copy)"
+    stable="$(default_worktree)"
+    [[ "$stable" != "$worktree" ]] || return 0
+
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        src="$stable/$entry"
+        dst="$worktree/$entry"
+        [[ -e "$src" ]] || continue
+        [[ ! -e "$dst" ]] || continue
+        # A directory pattern ("node_modules/") only matches a path git can
+        # see is a directory, and the destination does not exist yet -- so the
+        # probe has to carry the trailing slash itself.
+        probe="$entry"
+        if [[ -d "$src" ]]; then
+            probe="$entry/"
+        fi
+        if ! git -C "$worktree" check-ignore -q -- "$probe"; then
+            log "refusing to share non-ignored cache path: $entry (add it to the project's .gitignore)"
+            return 1
+        fi
+        mkdir -p "$(dirname "$dst")" || return 1
+        case "$mode" in
+            link) ln -sfn "$src" "$dst" || return 1; log "linked cache $entry" ;;
+            *)    cp -a "$src" "$dst" || return 1; log "copied cache $entry" ;;
+        esac
+    done < <(printf '%s\n' "$paths" | tr ',' '\n')
     return 0
 }
 
 # Lifecycle hooks: user-owned scripts in the orchestration dir, never
 # sourced from the checkout itself (same trust boundary as read_conf).
-# post-add runs once after a new worktree is provisioned; post-sync runs
-# after every re-provision, because derived files (e.g. a generated
-# manifest) go stale when shared env values change. A failing hook keeps
-# the worktree: setup is retryable, secrets validation is not.
+#
+# pre-* gates the operation and runs from the orchestration root, because the
+# worktree does not exist yet; a failure aborts while rollback is still free.
+# post-* runs from inside the finished worktree, and a failure keeps that
+# worktree -- setup is retryable -- but still propagates to the caller's exit
+# status. Swallowing it was the bug: an agent that cannot observe failed setup
+# goes on to build against a half-configured tree.
 run_hook() {
     local name="$1" root="$2" worktree="$3"
     local hook="$root/local/hooks/$name"
+    local async_hook="$hook.async" cwd logdir logfile
+
+    # post-remove joins the pre-* hooks in running from the root: by the time
+    # it fires its worktree is gone, so there is nothing to cd into.
+    case "$name" in
+        pre-*|post-remove) cwd="$root" ;;
+        *)                 cwd="$worktree" ;;
+    esac
+
+    # <stage>.async detaches the hook and logs it, for the slow setup work
+    # (dependency installs, image pulls) whose latency is the whole reason to
+    # want a background stage. It is a separate file from the blocking hook so
+    # a project can have both: the part that must succeed before the command
+    # returns, and the part that only has to finish eventually.
+    if [[ -e "$async_hook" ]]; then
+        case "$name" in
+            pre-*)
+                # A gate that does not block is not a gate.
+                log "warning: ignoring $(basename "$async_hook") -- pre-* hooks cannot run asynchronously"
+                ;;
+            *)
+                if [[ -x "$async_hook" ]]; then
+                    logdir="$root/state/hooks"
+                    mkdir -p "$logdir"
+                    logfile="$logdir/$(basename "$worktree")-$name.log"
+                    log "running $name.async in background (log: $logfile)"
+                    ( cd "$cwd" && "$async_hook" "$worktree" ) >"$logfile" 2>&1 &
+                    # Reparented to init when wt exits; nothing here ever waits
+                    # on it, so its status is only ever readable in the log.
+                    disown 2>/dev/null || true
+                fi
+                ;;
+        esac
+    fi
+
     [[ -x "$hook" ]] || return 0
     log "running $name hook: $hook"
-    if ! (cd "$worktree" && "$hook" "$worktree"); then
-        log "warning: $name hook failed; continuing (fix and re-run: $hook $worktree)"
+    if (cd "$cwd" && "$hook" "$worktree"); then
+        return 0
     fi
+    case "$name" in
+        pre-*)       log "$name hook failed" ;;
+        post-remove) log "$name hook failed; the worktree was still removed" ;;
+        *)           log "$name hook failed; worktree kept (fix and re-run: $hook $worktree)" ;;
+    esac
+    return 1
 }
 
 # ----------------------------------------------------- runtime identity ----
@@ -401,7 +601,10 @@ read_conf() {
     local conf="$1" key="$2" default="$3" val=""
     if [[ -f "$conf" ]]; then
         val="$(sed -n "s/^${key}=//p" "$conf" | head -1 | tr -d '"' | tr -d "'")"
-        case "$val" in *[!A-Za-z0-9._/-]*) val="" ;; esac
+        # Comma is allowed so list-valued keys (CACHE_PATHS) can be expressed.
+        # It stays inert because values are never eval'd, only compared and
+        # split.
+        case "$val" in *[!A-Za-z0-9._/,-]*) val="" ;; esac
     fi
     printf '%s\n' "${val:-$default}"
 }
@@ -410,75 +613,167 @@ project_id() {
     basename "$WT_ROOT"
 }
 
-# Atomic-mkdir lock: flock is absent on macOS, mkdir is atomic everywhere.
-with_ports_lock() {
-    local lockdir="$1" tries=0
-    until mkdir "$lockdir" 2>/dev/null; do
-        tries=$((tries + 1))
-        [[ "$tries" -lt 50 ]] || return 1
-        sleep 0.1
+# The registry lock is flock(2) on state/ports.lock, held through fd 9. The
+# kernel drops it when the holding process exits -- any exit, including
+# kill -9 -- so there is no staleness to judge, no owner to record, and no
+# signal trap to install. flock(1) ships in util-linux and busybox on Linux;
+# macOS lacks it in the base system, so the installer's brew list carries the
+# `flock` formula and acquisition fails loudly when the binary is absent.
+#
+# The critical sections spawn nothing long-lived: a child inheriting fd 9
+# would keep the lock alive past this process, which is the one way an flock
+# can outstay its owner.
+acquire_ports_lock() {
+    local lockpath="$1"
+    command -v flock >/dev/null 2>&1 \
+        || { log "flock not found; install util-linux (Linux) or 'brew install flock' (macOS)"; return 1; }
+    # A symlink here was left by the pre-flock scheme, where the link target
+    # named the lock's owner; opening it would create a stray file named
+    # after that token. That scheme released on every exit, so nothing live
+    # holds one and removal is safe advice.
+    if [[ -L "$lockpath" ]]; then
+        log "port lock is a symlink left by an older $WT_NAME: $lockpath (remove it)"
+        return 1
+    fi
+    if [[ -e "$lockpath" && ! -f "$lockpath" ]]; then
+        log "port lock path exists and is not a regular file: $lockpath (remove it)"
+        return 1
+    fi
+    exec 9>>"$lockpath" || { log "cannot open port lock: $lockpath"; return 1; }
+    if ! flock -w 5 9; then
+        exec 9>&-
+        log "port registry is locked by another process: $lockpath"
+        return 1
+    fi
+}
+
+release_ports_lock() {
+    exec 9>&- 2>/dev/null || true
+}
+
+# A registry hit only proves no other worktree claimed the port. It says
+# nothing about unrelated processes already listening, which is exactly how a
+# worktree gets an allocation it cannot bind. One connect() per port converts
+# that late failure into a different allocation.
+#
+# Degradation is deliberate: a bash built without /dev/tcp fails every connect,
+# every port reads as free, and behaviour falls back to registry-only.
+port_in_use() {
+    ( exec 3<>"/dev/tcp/127.0.0.1/$1" ) >/dev/null 2>&1
+}
+
+# Free means: overlapping no registered block (including single-port entries
+# written before ranges existed) and nothing currently listening.
+block_free() {
+    local start="$1" size="$2" registry="$3" end p
+    end=$((start + size - 1))
+    if awk -F'\t' -v s="$start" -v e="$end" '
+        NF >= 3 && !(e < $2 + 0 || s > $3 + 0) { found = 1 }
+        NF == 2 && $2 + 0 >= s && $2 + 0 <= e  { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' "$registry"; then
+        return 1
+    fi
+    p="$start"
+    while [[ "$p" -le "$end" ]]; do
+        if port_in_use "$p"; then return 1; fi
+        p=$((p + 1))
     done
     return 0
 }
 
-# Allocate (or return the already-allocated) port for a slug. Registry is
-# state/ports.tsv: "<slug>\t<port>" per line.
-allocate_port() {
+# Allocate (or return the already-allocated) port block for a slug, printing
+# "<start>\t<end>". Registry is state/ports.tsv: "<slug>\t<start>\t<end>".
+#
+# One port per worktree ran out as soon as a tree wanted an app, a database and
+# a debugger, so allocation is block-at-a-time. Two-column rows written by the
+# previous scheme are still read, and still honoured as occupied, so an
+# existing state/ dir needs no migration step.
+allocate_ports() {
     local root="$1" slug="$2" conf="$3"
-    local start end registry lockdir existing port
+    local start end size registry lockpath existing port
     start="$(read_conf "$conf" PORT_RANGE_START 3100)"
     end="$(read_conf "$conf" PORT_RANGE_END 3999)"
+    size="$(read_conf "$conf" PORT_BLOCK_SIZE 10)"
     # The conf is checkout-controlled; a non-numeric or inverted range must
     # not abort mid-add (set -e turns a bad arithmetic test into an exit).
     case "$start" in ''|*[!0-9]*) log "warning: invalid PORT_RANGE_START in $conf; using 3100"; start=3100 ;; esac
     case "$end" in ''|*[!0-9]*) log "warning: invalid PORT_RANGE_END in $conf; using 3999"; end=3999 ;; esac
+    case "$size" in ''|*[!0-9]*|0) log "warning: invalid PORT_BLOCK_SIZE in $conf; using 10"; size=10 ;; esac
     if [[ "$start" -gt "$end" ]]; then
         log "warning: PORT_RANGE_START > PORT_RANGE_END in $conf; using 3100-3999"
         start=3100 end=3999
     fi
     registry="$root/state/ports.tsv"
-    lockdir="$root/state/ports.lock.d"
+    lockpath="$root/state/ports.lock"
     mkdir -p "$root/state"
     touch "$registry"
 
-    with_ports_lock "$lockdir" || { log "warning: port registry is locked; skipping allocation"; return 1; }
+    acquire_ports_lock "$lockpath" || { log "warning: skipping port allocation"; return 1; }
 
-    existing="$(awk -F'\t' -v s="$slug" '$1 == s { print $2; exit }' "$registry")"
+    existing="$(awk -F'\t' -v s="$slug" '$1 == s { if (NF >= 3) print $2 "\t" $3; else print $2 "\t" $2; exit }' "$registry")"
     if [[ -n "$existing" ]]; then
-        rmdir "$lockdir"
+        release_ports_lock
         printf '%s\n' "$existing"
         return 0
     fi
 
     port="$start"
-    while [[ "$port" -le "$end" ]]; do
-        if ! awk -F'\t' -v p="$port" '$2 == p { found=1 } END { exit found ? 0 : 1 }' "$registry"; then
-            printf '%s\t%s\n' "$slug" "$port" >> "$registry"
-            rmdir "$lockdir"
-            printf '%s\n' "$port"
+    while [[ $((port + size - 1)) -le "$end" ]]; do
+        if block_free "$port" "$size" "$registry"; then
+            printf '%s\t%s\t%s\n' "$slug" "$port" "$((port + size - 1))" >> "$registry"
+            release_ports_lock
+            printf '%s\t%s\n' "$port" "$((port + size - 1))"
             return 0
         fi
+        # One port, not one block. Stepping by the block size only ever
+        # considers ranges aligned to PORT_RANGE_START, which is fine for
+        # blocks wt allocated but not for arbitrary listeners: with size 10 and
+        # ports 3104 and 3115 taken, 3105-3114 is free and no aligned candidate
+        # finds it. The pool is small enough that the extra probes are bounded.
         port=$((port + 1))
     done
-    rmdir "$lockdir"
-    log "warning: no free port in $start-$end"
+    release_ports_lock
+    log "warning: no free block of $size ports in $start-$end"
     return 1
+}
+
+# Rewrite the registry without the slug's row. The caller holds the lock.
+ports_registry_drop() {
+    local registry="$1" slug="$2" tmp
+    tmp="$registry.tmp.$$"
+    if ! awk -F'\t' -v s="$slug" '$1 != s' "$registry" > "$tmp"; then
+        rm -f "$tmp"
+        log "failed to rewrite port registry: $registry"
+        return 1
+    fi
+    if ! mv "$tmp" "$registry"; then
+        rm -f "$tmp"
+        log "failed to rewrite port registry: $registry"
+        return 1
+    fi
 }
 
 release_port() {
     local root="$1" slug="$2"
-    local registry="$root/state/ports.tsv" lockdir="$root/state/ports.lock.d" tmp
+    local registry="$root/state/ports.tsv" status=0
     [[ -f "$registry" ]] || return 0
-    with_ports_lock "$lockdir" || return 0
-    tmp="$registry.tmp.$$"
-    awk -F'\t' -v s="$slug" '$1 != s' "$registry" > "$tmp" && mv "$tmp" "$registry"
-    rmdir "$lockdir"
+    # A failure here must be loud and nonzero: swallowing it reports success
+    # while the reservation stays behind, eroding the pool until doctor
+    # notices the orphan.
+    acquire_ports_lock "$root/state/ports.lock" || {
+        log "warning: port reservation for $slug not released; '$WT_NAME doctor' reports it as orphaned"
+        return 1
+    }
+    ports_registry_drop "$registry" "$slug" || status=1
+    release_ports_lock
+    return "$status"
 }
 
 # Generated per-worktree runtime identity. Written only when the project
 # ignores the destination (same invariant as provisioning); skipped with a
 # warning otherwise so add still succeeds. Safe to re-run at sync time:
-# every value is a pure function of slug/project (allocate_port returns
+# every value is a pure function of slug/project (allocate_ports returns
 # the slug's existing port), the file is rewritten only when the content
 # actually changes, and a transient allocation failure never downgrades a
 # file that already carries an APP_PORT.
@@ -491,25 +786,46 @@ write_worktree_env() {
         log "warning: .env.worktree is not gitignored by this project; skipping runtime identity"
         return 0
     fi
-    app_port="$(allocate_port "$root" "$slug" "$conf")" || app_port=""
-    if [[ -z "$app_port" ]] && grep -q '^APP_PORT=' "$envfile" 2>/dev/null; then
-        log "warning: port allocation failed; keeping existing $envfile"
-        return 0
+    local block port_end=""
+    block="$(allocate_ports "$root" "$slug" "$conf")" || block=""
+    app_port="${block%%$'\t'*}"
+    # Not `[[ -n ... ]] && port_end=...`: as a standalone statement that
+    # returns 1 when the block is empty, and set -e turns a failed allocation
+    # into a failed sync.
+    if [[ -n "$block" ]]; then
+        port_end="${block##*$'\t'}"
+    fi
+    if [[ -z "$app_port" ]]; then
+        if grep -q '^APP_PORT=' "$envfile" 2>/dev/null; then
+            log "warning: port allocation failed; keeping the block already recorded in $envfile"
+            return 0
+        fi
+        # Nothing to fall back on. Writing the env without a port hands back a
+        # worktree that cannot run, reported as a success -- the caller has no
+        # way to tell it apart from a good one.
+        log "port allocation failed and no block is recorded in $envfile"
+        return 1
     fi
     slug_db="$(printf '%s' "$slug" | tr '.-' '__')"
     content="$(
-        printf '# Generated by wt. Do not commit.\n'
+        printf '# Generated by %s. Do not commit.\n' "$WT_NAME"
         printf 'WORKTREE_SLUG=%s\n' "$slug"
         printf 'COMPOSE_PROJECT_NAME=%s-%s\n' "$pid" "$slug"
         printf 'DATABASE_NAME=%s_%s\n' "$(printf '%s' "$pid" | tr '.-' '__')" "$slug_db"
         printf 'CACHE_NAMESPACE=%s\n' "$slug"
-        if [[ -n "$app_port" ]]; then printf 'APP_PORT=%s\n' "$app_port"; fi
+        # APP_PORT is the block's first port, kept under its original name so
+        # existing compose files and scripts do not have to change.
+        if [[ -n "$app_port" ]]; then
+            printf 'APP_PORT=%s\n' "$app_port"
+            printf 'WORKTREE_PORT_START=%s\n' "$app_port"
+            printf 'WORKTREE_PORT_END=%s\n' "$port_end"
+        fi
     )"
     if [[ -f "$envfile" ]] && printf '%s\n' "$content" | cmp -s - "$envfile"; then
         return 0
     fi
-    printf '%s\n' "$content" > "$envfile"
-    chmod 600 "$envfile"
+    printf '%s\n' "$content" > "$envfile" || return 1
+    chmod 600 "$envfile" || return 1
 }
 
 # ----------------------------------------------------------- containers ----
@@ -642,7 +958,8 @@ cmd_init() {
     local url="$1" root="$2"
     [[ ! -e "$root/repo.git" ]] || die "already initialized: $root/repo.git"
 
-    mkdir -p "$root/local/shared" "$root/local/template" "$root/state" "$root/wt"
+    mkdir -p "$root/local/shared" "$root/local/template" "$root/local/link" \
+             "$root/local/hooks" "$root/state" "$root/wt"
     chmod 700 "$root/local"
 
     # Transactional: a failed clone or main checkout removes repo.git so a
@@ -682,14 +999,119 @@ cmd_init() {
     printf '%s\n' "$root"
 }
 
+# pr:N and mr:N are synonyms on both forges. The number is unambiguous, so
+# rejecting `pr:` against a GitLab remote would add friction without adding
+# safety; the forge comes from the remote, never from the prefix typed.
+#
+# WT_FORGE overrides detection for self-hosted instances whose hostname
+# carries neither vendor name.
+detect_forge() {
+    local url
+    case "${WT_FORGE:-}" in
+        github|gitlab) printf '%s\n' "$WT_FORGE"; return 0 ;;
+        '') ;;
+        *) die "WT_FORGE must be 'github' or 'gitlab' (got: $WT_FORGE)" ;;
+    esac
+    url="$(git --git-dir="$WT_GIT_DIR" config remote.origin.url 2>/dev/null || true)"
+    case "$url" in
+        *gitlab*) printf 'gitlab\n' ;;
+        *github*) printf 'github\n' ;;
+        # An unrecognised host requires explicit configuration. Installed
+        # CLIs are a property of the machine, not the repository -- a
+        # self-hosted GitLab remote on a machine with gh would fetch
+        # refs/pull/N/head and fail confusingly.
+        *) die "cannot tell which forge $url belongs to; set WT_FORGE=github|gitlab" ;;
+    esac
+}
+
+# Resolving a request through gh or glab was removed rather than fixed. Those
+# CLIs return the contributor's branch name, which does not exist on origin
+# when the request came from a fork -- the common case for an outside
+# contribution. The forge's own request ref does exist there, so cmd_add
+# fetches that directly and needs neither CLI, nor jq, nor authentication for
+# a public repository.
+
+# Undo a half-made worktree. The branch is deleted only when this invocation
+# created it: `add` also attaches to a branch that already exists, and deleting
+# that one would destroy commits the worktree never owned -- a failed cache
+# path is not a reason to lose unpushed work.
+rollback_add() {
+    local dest="$1" branch="$2" created="$3"
+    git --git-dir="$WT_GIT_DIR" worktree remove --force "$dest" >/dev/null 2>&1 || true
+    if [[ "$created" -eq 1 ]]; then
+        git --git-dir="$WT_GIT_DIR" branch -D "$branch" >/dev/null 2>&1 || true
+    fi
+    # The reservation is recorded before .env.worktree is written, so a
+    # failure between the two would leave a block owned by a worktree that no
+    # longer exists -- precisely what doctor reports as an orphan. Releasing
+    # is a no-op when nothing was allocated; when release itself fails it
+    # warns and names doctor, but must not mask the add failure being rolled
+    # back.
+    if [[ "$WT_MODE" == "orchestration" ]]; then
+        release_port "$WT_ROOT" "$(basename "$dest")" || true
+    fi
+}
+
 cmd_add() {
+    local json=0 add_args=() a
+    for a in "$@"; do
+        case "$a" in
+            --json) json=1 ;;
+            *) add_args+=("$a") ;;
+        esac
+    done
+    set -- ${add_args[@]+"${add_args[@]}"}
     check_args add 1 2 "$@"
-    local name="$1" base="${2:-}"
+    local name="$1" base="${2:-}" is_request=0
     detect_mode
     [[ "$WT_MODE" != "orchestration" || "$name" != "main" ]] \
-        || die "'main' is reserved for the stable checkout (use 'wt sync main' to provision it)"
+        || die "'main' is reserved for the stable checkout (use '$WT_NAME sync main' to provision it)"
 
-    local dest branch
+    case "$name" in
+        pr:*|mr:*)
+            local req_num="${name#*:}" forge remote_ref
+            case "$req_num" in ''|*[!0-9]*) die "not a request number: $name" ;; esac
+            # [base] cannot mean anything here: the worktree is defined by the
+            # request head, so accepting a base would silently produce a tree
+            # that is not the revision under review.
+            [[ -z "$base" ]] \
+                || die "[base] cannot be combined with $name: a request worktree is always based on the request head"
+            forge="$(detect_forge)"
+            case "$forge" in
+                gitlab) remote_ref="refs/merge-requests/$req_num/head"; name="mr-$req_num" ;;
+                *)      remote_ref="refs/pull/$req_num/head";           name="pr-$req_num" ;;
+            esac
+            # Fetched from the forge's own request namespace rather than the
+            # contributor's branch. A request opened from a fork has no
+            # refs/heads/<branch> on origin at all, while the request ref
+            # always exists on the upstream repository, is immutable, and
+            # names the exact revision under review. The local branch is
+            # pr-N/mr-N so it cannot collide with a contributor's branch name.
+            git --git-dir="$WT_GIT_DIR" fetch --quiet origin "+$remote_ref:refs/remotes/origin/$name" \
+                || die "cannot fetch $remote_ref from origin (no such request on $forge?)"
+            base="origin/$name"
+            is_request=1
+
+            # A local pr-N/mr-N left behind by an earlier `remove` without
+            # --branch is checked out in preference to what was just fetched,
+            # which silently produces the revision the request used to be. The
+            # same name may also belong to an unrelated branch someone created
+            # by hand. Both are refused rather than guessed at: updating the
+            # branch could discard commits made on top of it, and using it as
+            # found contradicts the guarantee that this worktree is the
+            # revision under review.
+            if git --git-dir="$WT_GIT_DIR" show-ref --verify --quiet "refs/heads/$name"; then
+                local have want
+                have="$(git --git-dir="$WT_GIT_DIR" rev-parse --short "refs/heads/$name")"
+                want="$(git --git-dir="$WT_GIT_DIR" rev-parse --short "refs/remotes/origin/$name")"
+                [[ "$have" == "$want" ]] || die "local branch '$name' is at $have but $forge request $req_num is now at $want; delete the stale branch first (git --git-dir='$WT_GIT_DIR' branch -D $name, or '$WT_NAME remove $name --branch' while a worktree still uses it)"
+            fi
+
+            log "fetched $forge request $req_num as $name ($(git --git-dir="$WT_GIT_DIR" rev-parse --short "refs/remotes/origin/$name"))"
+            ;;
+    esac
+
+    local dest branch hook_status=0 created_branch=0
     # The name doubles as the branch when it is a legal ref (slashes fine,
     # e.g. user/CLK-943); otherwise the branch falls back to the slug.
     if git check-ref-format --branch "$name" >/dev/null 2>&1; then
@@ -701,6 +1123,10 @@ cmd_add() {
     [[ ! -e "$dest" ]] || die "already exists: $dest"
     mkdir -p "$(dirname "$dest")"
 
+    if [[ "$WT_MODE" == "orchestration" ]]; then
+        run_hook pre-add "$WT_ROOT" "$dest" || die "pre-add hook failed; nothing created"
+    fi
+
     ensure_rel_flag
     if git --git-dir="$WT_GIT_DIR" show-ref --verify --quiet "refs/heads/$branch"; then
         # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
@@ -708,45 +1134,92 @@ cmd_add() {
     else
         # New branches start at the true remote head, not the head as of
         # the last fetch. Best-effort: an offline add still works.
-        if git --git-dir="$WT_GIT_DIR" config remote.origin.url >/dev/null 2>&1; then
+        #
+        # Skipped for a request: its ref was already fetched above and lives
+        # outside refs/heads/*, so --prune here would delete it as stale
+        # against the configured refspec before worktree add can use it.
+        if [[ "$is_request" -eq 0 ]] && git --git-dir="$WT_GIT_DIR" config remote.origin.url >/dev/null 2>&1; then
             git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin 2>/dev/null \
                 || log "warning: fetch failed; basing '$branch' on last-known origin state"
         fi
         [[ -n "$base" ]] || base="$(default_base "$WT_GIT_DIR")"
         # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
         git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG -b "$branch" "$dest" "$base" >&2
+        created_branch=1
     fi
 
     if [[ "$WT_MODE" == "orchestration" ]]; then
         if ! provision_local_files "$WT_ROOT" "$dest"; then
             # Roll back: a half-provisioned worktree must not survive a
             # failed security validation.
-            git --git-dir="$WT_GIT_DIR" worktree remove --force "$dest" >/dev/null 2>&1 || true
-            git --git-dir="$WT_GIT_DIR" branch -D "$branch" >/dev/null 2>&1 || true
+            rollback_add "$dest" "$branch" "$created_branch"
             die "provisioning failed; worktree rolled back"
         fi
-        write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")"
-        run_hook post-add "$WT_ROOT" "$dest"
+        if ! share_build_caches "$WT_ROOT" "$dest" "$dest/.dev/worktree.conf"; then
+            rollback_add "$dest" "$branch" "$created_branch"
+            die "cache sharing failed; worktree rolled back"
+        fi
+        if ! write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")"; then
+            rollback_add "$dest" "$branch" "$created_branch"
+            die "could not assign a port block; worktree rolled back"
+        fi
+        run_hook post-add "$WT_ROOT" "$dest" || hook_status=1
     fi
 
     log "created $dest (branch: $branch, mode: $WT_MODE)"
+    # The path is reported even when the hook failed: the worktree exists and
+    # the caller needs to be able to find it to fix things. The nonzero status
+    # is what stops the shell wrapper from cd-ing into a broken tree.
+    if (( json )); then
+        local pstart="" pend=""
+        if [[ -f "$dest/.env.worktree" ]]; then
+            pstart="$(sed -n 's/^WORKTREE_PORT_START=//p' "$dest/.env.worktree" | head -1)"
+            pend="$(sed -n 's/^WORKTREE_PORT_END=//p' "$dest/.env.worktree" | head -1)"
+        fi
+        printf '{"path":"%s","name":"%s","branch":"%s","mode":"%s","port_start":%s,"port_end":%s,"hook_status":%s}\n' \
+            "$(json_escape "$dest")" "$(json_escape "$(basename "$dest")")" \
+            "$(json_escape "$branch")" "$(json_escape "$WT_MODE")" \
+            "${pstart:-null}" "${pend:-null}" "$hook_status"
+        return "$hook_status"
+    fi
     printf '%s\n' "$dest"
+    return "$hook_status"
 }
 
 cmd_list() {
-    local names=0 arg
+    local names=0 json=0 arg
     for arg in "$@"; do
         case "$arg" in
             --names) names=1 ;;
+            --json)  json=1 ;;
             *) die "usage: $(command_synopsis list)" ;;
         esac
     done
+    [[ $((names + json)) -le 1 ]] || die "usage: $(command_synopsis list)"
     detect_mode
     if [[ "$names" -eq 1 ]]; then
         local path
         while IFS= read -r path; do
             printf '%s\n' "${path##*/}"
         done < <(registered_worktrees)
+        return 0
+    fi
+    if [[ "$json" -eq 1 ]]; then
+        local path head branch sep=""
+        printf '{"mode":"%s","root":"%s","worktrees":[' \
+            "$(json_escape "$WT_MODE")" "$(json_escape "$WT_ROOT")"
+        while IFS= read -r path; do
+            head="$(git -C "$path" rev-parse HEAD 2>/dev/null || true)"
+            # Empty on a detached HEAD, which is a legitimate worktree state
+            # rather than an error, so it reports as null instead of failing.
+            branch="$(git -C "$path" symbolic-ref --short HEAD 2>/dev/null || true)"
+            printf '%s{"name":"%s","path":"%s","branch":%s,"head":"%s"}' \
+                "$sep" "$(json_escape "${path##*/}")" "$(json_escape "$path")" \
+                "$([[ -n "$branch" ]] && printf '"%s"' "$(json_escape "$branch")" || printf 'null')" \
+                "$(json_escape "$head")"
+            sep=","
+        done < <(registered_worktrees)
+        printf ']}\n'
         return 0
     fi
     log "mode: $WT_MODE (root: $WT_ROOT)"
@@ -791,6 +1264,13 @@ cmd_pull() {
     git -C "$dest" merge --ff-only "origin/$branch" >&2 \
         || die "cannot fast-forward: $dest has commits not on origin/$branch"
     log "pulled $dest ($branch -> origin/$branch)"
+    # New commits can invalidate installed dependencies and generated files,
+    # so this is the natural place to reinstall or regenerate them.
+    local hook_status=0
+    if [[ "$WT_MODE" == "orchestration" ]]; then
+        run_hook post-pull "$WT_ROOT" "$dest" || hook_status=1
+    fi
+    return "$hook_status"
 }
 
 cmd_git() {
@@ -830,7 +1310,7 @@ cmd_sync() {
         case "$arg" in
             --all)  all=1 ;;
             --diff) diff=1 ;;
-            -*) die "unknown option: $arg (see 'wt sync --help')" ;;
+            -*) die "unknown option: $arg (see '$WT_NAME sync --help')" ;;
             *)  [[ -z "$name" ]] || die "usage: $(command_synopsis sync)"; name="$arg" ;;
         esac
     done
@@ -866,10 +1346,23 @@ cmd_sync() {
         local wt_path failures=0
         while IFS= read -r wt_path; do
             [[ -d "$wt_path" ]] || continue
+            # The same gate the single-worktree path runs. Skipping it here
+            # meant a project could reject an unsafe sync for `sync <name>`
+            # and still have it happen under `sync --all`. Per-worktree, so
+            # one refusal isolates that tree instead of aborting the sweep.
+            if ! run_hook pre-sync "$WT_ROOT" "$wt_path"; then
+                log "WARNING: pre-sync hook failed for $wt_path; nothing copied there"
+                failures=$((failures + 1))
+                continue
+            fi
             if provision_local_files "$WT_ROOT" "$wt_path"; then
                 log "synced local/ into $wt_path"
-                write_worktree_env "$WT_ROOT" "$wt_path" "$(basename "$wt_path")"
-                run_hook post-sync "$WT_ROOT" "$wt_path"
+                if ! write_worktree_env "$WT_ROOT" "$wt_path" "$(basename "$wt_path")"; then
+                    log "WARNING: could not assign a port block for $wt_path"
+                    failures=$((failures + 1))
+                    continue
+                fi
+                run_hook post-sync "$WT_ROOT" "$wt_path" || failures=$((failures + 1))
             else
                 log "WARNING: sync failed validation for $wt_path; nothing copied there"
                 failures=$((failures + 1))
@@ -882,9 +1375,11 @@ cmd_sync() {
     local dest
     dest="$(resolve_or_default "$name")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
+    run_hook pre-sync "$WT_ROOT" "$dest" || die "pre-sync hook failed; nothing copied"
     provision_local_files "$WT_ROOT" "$dest" || die "sync failed validation; nothing copied"
     log "synced local/ into $dest"
-    write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")"
+    write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")" \
+        || die "could not assign a port block for $dest"
     run_hook post-sync "$WT_ROOT" "$dest"
 }
 
@@ -893,7 +1388,7 @@ cmd_remove() {
     for arg in "$@"; do
         case "$arg" in
             --branch) delete_branch=1 ;;
-            -*) die "unknown option: $arg (see 'wt remove --help')" ;;
+            -*) die "unknown option: $arg (see '$WT_NAME remove --help')" ;;
             *) [[ -n "$name" ]] && die "usage: $(command_synopsis remove)"; name="$arg" ;;
         esac
     done
@@ -917,7 +1412,22 @@ cmd_remove() {
     [[ -z "$(git -C "$dest" ls-files --others --exclude-standard)" ]] \
         || die "worktree has untracked files: $dest"
 
+    if [[ "$WT_MODE" == "orchestration" ]]; then
+        run_hook pre-remove "$WT_ROOT" "$dest" || die "pre-remove hook failed; nothing removed"
+    fi
+
     teardown_containers "$slug"
+    # Releasing the port block is part of remove's contract, so the registry
+    # lock is taken before anything irreversible and held until the row is
+    # gone: if it cannot be held, the worktree survives untouched rather than
+    # being destroyed with its reservation left behind. Container teardown
+    # stays outside the hold -- it is slow, and restartable.
+    local ports_locked=0
+    if [[ "$WT_MODE" == "orchestration" && -f "$WT_ROOT/state/ports.tsv" ]]; then
+        acquire_ports_lock "$WT_ROOT/state/ports.lock" \
+            || die "port registry is locked; worktree left in place"
+        ports_locked=1
+    fi
     # --force only bypasses git's own dirtiness refusal, which counts
     # ignored files (.env.worktree, provisioned .env.*). The checks above
     # already guarantee nothing but ignored files remains.
@@ -926,8 +1436,19 @@ cmd_remove() {
         git --git-dir="$WT_GIT_DIR" branch -D "$branch" >&2
     fi
     git --git-dir="$WT_GIT_DIR" worktree prune
-    [[ "$WT_MODE" == "orchestration" ]] && release_port "$WT_ROOT" "$slug"
+    local status=0
+    if [[ "$WT_MODE" == "orchestration" ]]; then
+        if [[ "$ports_locked" -eq 1 ]]; then
+            ports_registry_drop "$WT_ROOT/state/ports.tsv" "$slug" || status=1
+            release_ports_lock
+        fi
+        # Runs after the port is released and the containers are gone, which
+        # is the only point where the per-worktree database, volumes, and any
+        # external registration can actually be cleaned up.
+        run_hook post-remove "$WT_ROOT" "$dest" || status=1
+    fi
     log "removed $dest"
+    return "$status"
 }
 
 cmd_prune() {
@@ -937,6 +1458,11 @@ cmd_prune() {
     log "pruned"
 }
 
+# Frozen literals, deliberately not $WT_NAME. strip_managed_block matches them
+# with string equality against .ignore files already on disk, and
+# ignore_file_current compares the whole block byte for byte -- so deriving
+# either from the executable's name would orphan every existing managed block
+# on a rename and report the file stale forever after.
 WT_IGNORE_BEGIN='# >>> wt ignore >>>'
 WT_IGNORE_END='# <<< wt ignore <<<'
 
@@ -1036,7 +1562,7 @@ cmd_ignore() {
     for arg in "$@"; do
         case "$arg" in
             --print) print_only=1 ;;
-            -*)      die "unknown option: $arg (see 'wt ignore --help')" ;;
+            -*)      die "unknown option: $arg (see '$WT_NAME ignore --help')" ;;
             *)       [[ -z "$target" ]] || die "usage: $(command_synopsis ignore)"
                      target="$arg" ;;
         esac
@@ -1056,35 +1582,87 @@ cmd_ignore() {
     log "wrote $root/.ignore"
 }
 
+# The executable is deployed as a symlink into a checkout that moves and can
+# be renamed, so the version number alone does not identify what answered.
+# Resolving the link and reading the checkout's commit is what makes a bug
+# report reproducible.
+cmd_version() {
+    local json=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json) json=1 ;;
+            *) die "usage: $(command_synopsis version)" ;;
+        esac
+    done
+
+    local real src commit=""
+    real="$(wt_realpath "$0")"
+    src="$(dirname "$real")"
+    if git -C "$src" rev-parse --git-dir >/dev/null 2>&1; then
+        commit="$(git -C "$src" rev-parse --short HEAD 2>/dev/null || true)"
+    fi
+
+    if (( json )); then
+        printf '{"name":"%s","version":"%s","path":"%s","commit":"%s"}\n' \
+            "$(json_escape "$WT_NAME")" "$(json_escape "$WT_VERSION")" \
+            "$(json_escape "$real")" "$(json_escape "$commit")"
+        return 0
+    fi
+    printf '%s %s\n' "$WT_NAME" "$WT_VERSION"
+    printf 'path:   %s\n' "$real"
+    [[ -n "$commit" ]] && printf 'commit: %s\n' "$commit"
+    return 0
+}
+
+# Each check reports through one of these so --json can carry the same
+# findings the text output does. The human strings are assembled here rather
+# than at the call sites, which is what keeps the two renderings from drifting.
+DOCTOR_JSON=0
+DOCTOR_ROWS=()
+
+doctor_row() {
+    local status="$1"; shift
+    DOCTOR_ROWS+=("{\"status\":\"$(json_escape "$status")\",\"detail\":\"$(json_escape "$*")\"}")
+}
+d_ok()   { (( DOCTOR_JSON )) || log "$*";            doctor_row ok   "$*"; }
+d_warn() { (( DOCTOR_JSON )) || log "WARNING: $*";   doctor_row warn "$*"; }
+d_note() { (( DOCTOR_JSON )) || log "note: $*";      doctor_row note "$*"; }
+
 cmd_doctor() {
-    check_args doctor 0 0 "$@"
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json) DOCTOR_JSON=1 ;;
+            *) die "usage: $(command_synopsis doctor)" ;;
+        esac
+    done
     detect_mode
     local failures=0 git_version
 
-    log "mode: $WT_MODE"
-    log "root: $WT_ROOT"
+    d_ok "mode: $WT_MODE"
+    d_ok "root: $WT_ROOT"
 
     git_version="$(git --version | awk '{print $3}')"
     if version_at_least "$git_version" "2.48.0"; then
-        log "git $git_version (>= 2.48: relative worktree paths available)"
+        d_ok "git $git_version (>= 2.48: relative worktree paths available)"
     else
-        log "WARNING: git $git_version < 2.48 -- worktrees get absolute pointers; per-worktree containers will not work"
+        d_warn "git $git_version < 2.48 -- worktrees get absolute pointers; per-worktree containers will not work"
         failures=$((failures + 1))
     fi
 
     if [[ "$(git --git-dir="$WT_GIT_DIR" config worktree.useRelativePaths 2>/dev/null)" == "true" ]] \
         || [[ "$(git config --global worktree.useRelativePaths 2>/dev/null)" == "true" ]]; then
-        log "worktree.useRelativePaths: true"
+        d_ok "worktree.useRelativePaths: true"
     else
-        log "WARNING: worktree.useRelativePaths not set; new worktrees from other tools get absolute pointers"
+        d_warn "worktree.useRelativePaths not set; new worktrees from other tools get absolute pointers"
         failures=$((failures + 1))
     fi
 
     if [[ "$WT_MODE" == "orchestration" ]]; then
         if git --git-dir="$WT_GIT_DIR" config --get-all remote.origin.fetch >/dev/null 2>&1; then
-            log "remote.origin.fetch: configured"
+            d_ok "remote.origin.fetch: configured"
         else
-            log "WARNING: origin has no fetch refspec (pre-fix bare clone) -- 'git fetch origin' is a silent no-op; fix: git --git-dir='$WT_GIT_DIR' config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'"
+            d_warn "origin has no fetch refspec (pre-fix bare clone) -- 'git fetch origin' is a silent no-op; fix: git --git-dir='$WT_GIT_DIR' config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'"
             failures=$((failures + 1))
         fi
 
@@ -1092,12 +1670,12 @@ cmd_doctor() {
         # <repo>-worktrees/ dir, so an .ignore inside the clone cannot bound
         # them -- that layout needs one in the parent, which wt does not own.
         if ignore_file_current "$WT_ROOT"; then
-            log ".ignore: current"
+            d_ok ".ignore: current"
         elif [[ -f "$WT_ROOT/.ignore" ]]; then
-            log "WARNING: $WT_ROOT/.ignore is stale (worktree dirs changed); fix: wt ignore '$WT_ROOT'"
+            d_warn "$WT_ROOT/.ignore is stale (worktree dirs changed); fix: $WT_NAME ignore '$WT_ROOT'"
             failures=$((failures + 1))
         else
-            log "WARNING: no $WT_ROOT/.ignore -- searches from here descend into every worktree and can hit the argv limit; fix: wt ignore '$WT_ROOT'"
+            d_warn "no $WT_ROOT/.ignore -- searches from here descend into every worktree and can hit the argv limit; fix: $WT_NAME ignore '$WT_ROOT'"
             failures=$((failures + 1))
         fi
     fi
@@ -1106,9 +1684,9 @@ cmd_doctor() {
     local wt_path
     while IFS= read -r wt_path; do
         if git -C "$wt_path" rev-parse --git-dir >/dev/null 2>&1; then
-            log "worktree ok: $wt_path"
+            d_ok "worktree ok: $wt_path"
         else
-            log "WARNING: worktree broken (try 'git worktree repair'): $wt_path"
+            d_warn "worktree broken (try 'git worktree repair'): $wt_path"
             failures=$((failures + 1))
         fi
     done < <(registered_worktrees)
@@ -1118,21 +1696,69 @@ cmd_doctor() {
             local dc_version
             dc_version="$(devcontainer --version 2>/dev/null)"
             if version_at_least "$dc_version" "0.81.0"; then
-                log "devcontainer CLI $dc_version (>= 0.81.0: worktree common-dir mounting available)"
+                d_ok "devcontainer CLI $dc_version (>= 0.81.0: worktree common-dir mounting available)"
             else
-                log "WARNING: devcontainer CLI ${dc_version:-unknown} < 0.81.0 -- --mount-git-worktree-common-dir unavailable; update the CLI"
+                d_warn "devcontainer CLI ${dc_version:-unknown} < 0.81.0 -- --mount-git-worktree-common-dir unavailable; update the CLI"
                 failures=$((failures + 1))
             fi
         else
-            log "note: devcontainer CLI not installed; per-worktree containers unavailable"
+            d_note "devcontainer CLI not installed; per-worktree containers unavailable"
         fi
     else
-        log "in-container: devcontainer CLI intentionally unavailable (containers never launch containers)"
+        d_ok "in-container: devcontainer CLI intentionally unavailable (containers never launch containers)"
     fi
 
     if [[ "$WT_MODE" == "orchestration" ]]; then
-        if [[ -d "$WT_ROOT/local" ]]; then log "local/ present"; else log "note: no local/ directory"; fi
-        if [[ -d "$WT_ROOT/state" ]]; then log "state/ present"; else log "note: no state/ directory"; fi
+        if [[ -d "$WT_ROOT/local" ]]; then d_ok "local/ present"; else d_note "no local/ directory"; fi
+        if [[ -d "$WT_ROOT/state" ]]; then d_ok "state/ present"; else d_note "no state/ directory"; fi
+
+        # Only `remove` releases a port block, so a worktree deleted any other
+        # way -- rm -rf, a `git worktree remove`, a prune after either --
+        # keeps its reservation forever and the pool erodes silently. Doctor
+        # is where that surfaces, because nothing else ever reads the registry
+        # against the worktrees that actually exist.
+        local lockfile="$WT_ROOT/state/ports.lock"
+        if ! command -v flock >/dev/null 2>&1; then
+            d_warn "flock not found -- port allocation and release will fail; install util-linux (Linux) or 'brew install flock' (macOS)"
+            failures=$((failures + 1))
+        elif [[ -L "$lockfile" ]]; then
+            d_warn "port lock is a symlink left by an older $WT_NAME: $lockfile -- remove it; the flock scheme needs a regular file"
+            failures=$((failures + 1))
+        elif [[ -e "$lockfile" && ! -f "$lockfile" ]]; then
+            d_warn "port lock path is not a regular file: $lockfile -- allocation cannot proceed until it is removed"
+            failures=$((failures + 1))
+        elif [[ -f "$lockfile" ]] && ! (exec 9>>"$lockfile" && flock -n 9) 2>/dev/null; then
+            # Held locks are informational: flock has no stale state to
+            # report, because the kernel drops the lock with its owner.
+            d_note "port registry is locked by a running process"
+        fi
+
+        local registry="$WT_ROOT/state/ports.tsv" live_slugs reg_slug orphans=0
+        if [[ -f "$registry" ]]; then
+            live_slugs="$(while IFS= read -r wt_path; do printf '%s\n' "${wt_path##*/}"; done < <(registered_worktrees))"
+            while IFS=$'\t' read -r reg_slug _; do
+                [[ -n "$reg_slug" ]] || continue
+                if ! printf '%s\n' "$live_slugs" | grep -qxF "$reg_slug"; then
+                    d_warn "orphaned port reservation: $reg_slug has no worktree; fix: remove its line from $registry (only '$WT_NAME remove' releases a block)"
+                    orphans=$((orphans + 1))
+                    failures=$((failures + 1))
+                fi
+            done < "$registry"
+            [[ "$orphans" -gt 0 ]] || d_ok "port registry: no orphaned reservations"
+        fi
+    fi
+
+    if (( DOCTOR_JSON )); then
+        local row sep=""
+        printf '{"mode":"%s","root":"%s","failures":%s,"checks":[' \
+            "$(json_escape "$WT_MODE")" "$(json_escape "$WT_ROOT")" "$failures"
+        for row in ${DOCTOR_ROWS[@]+"${DOCTOR_ROWS[@]}"}; do
+            printf '%s%s' "$sep" "$row"
+            sep=","
+        done
+        printf ']}\n'
+        [[ "$failures" -eq 0 ]] || exit 1
+        return 0
     fi
 
     if [[ "$failures" -gt 0 ]]; then
@@ -1154,10 +1780,11 @@ shift
 
 case "$command_name" in
     -h|--help) usage 0 ;;
+    -V|--version) cmd_version "$@"; exit 0 ;;
     help) [[ $# -gt 0 ]] && command_help "$1"; usage 0 ;;
 esac
 
-command_spec "$command_name" >/dev/null || die "unknown command: $command_name (see 'wt --help')"
+command_spec "$command_name" >/dev/null || die "unknown command: $command_name (see '$WT_NAME --help')"
 
 # A help flag must print help, never run the command: 'wt add --help' used to
 # reach cmd_add and create a worktree named 'help'. Scanning stops at '--' so
@@ -1189,5 +1816,6 @@ case "$command_name" in
     prune)        cmd_prune "$@" ;;
     ignore)       cmd_ignore "$@" ;;
     doctor)       cmd_doctor "$@" ;;
-    *) die "unknown command: $command_name (see 'wt --help')" ;;
+    version)      cmd_version "$@" ;;
+    *) die "unknown command: $command_name (see '$WT_NAME --help')" ;;
 esac

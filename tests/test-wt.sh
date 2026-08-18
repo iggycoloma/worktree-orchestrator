@@ -202,7 +202,7 @@ test_suite "argument and help handling"
 output=$("$WT" add --help 2>&1)
 status=$?
 assert_equals 0 "$status" "wt add --help exits 0"
-assert_contains "$output" "Usage: wt add <name> [base]" "wt add --help prints add's usage"
+assert_contains "$output" "Usage: wt add <name|pr:N> [base]" "wt add --help prints add's usage"
 assert_file_not_exists "$TMP/slugproj-worktrees/help/.git" "wt add --help creates no worktree"
 
 # Help is answered before any layout detection, so it works anywhere.
@@ -233,7 +233,7 @@ assert_file_not_exists "$TMP/slugproj-worktrees/x/.git" "wt add -x creates no wo
 
 output=$("$WT" add one two three 2>&1)
 assert_not_equals 0 $? "wt add rejects extra positional arguments"
-assert_contains "$output" "usage: wt add <name> [base]" "arity error shows the synopsis"
+assert_contains "$output" "usage: wt add <name|pr:N> [base]" "arity error shows the synopsis"
 
 output=$("$WT" sync -x 2>&1)
 assert_not_equals 0 $? "wt sync -x fails"
@@ -698,11 +698,15 @@ assert_contains "$(cat state/hooklog 2>/dev/null)" "added:$dest" "post-add hook 
 "$WT" sync hooked >/dev/null 2>&1
 assert_contains "$(cat state/hooklog 2>/dev/null)" "synced:$dest" "post-sync hook runs after sync"
 
-# A failing hook warns but never fails the command.
+# A failing post-* hook keeps the worktree -- setup is retryable -- but the
+# failure must reach the exit status, or an agent proceeds against a tree it
+# believes is configured.
 printf '#!/usr/bin/env bash\nexit 1\n' > local/hooks/post-sync
 chmod +x local/hooks/post-sync
 "$WT" sync hooked >/dev/null 2>&1
-assert_equals 0 $? "sync succeeds despite a failing post-sync hook"
+assert_equals 1 $? "failing post-sync hook fails the command"
+assert_file_exists "$dest/.env.worktree" "failing post-sync hook still leaves the worktree provisioned"
+rm -f local/hooks/post-sync
 
 # Idempotent env write: unchanged content is not rewritten (a read-only
 # file would make a rewrite fail, so success proves the skip).
@@ -1007,6 +1011,520 @@ if command -v zsh >/dev/null 2>&1; then
 else
     echo "  (zsh not installed -- skipping compinit binding check)"
 fi
+
+# ============================================================
+# Test Suite: version and rename-aware output
+# ============================================================
+test_suite "version and rename-aware output"
+
+assert_contains "$("$WT" version)" "wt " "version prints the name and number"
+assert_contains "$("$WT" version --json)" '"version"' "version --json carries a version field"
+assert_contains "$("$WT" version --json)" '"path"' "version --json names the resolved executable"
+assert_contains "$("$WT" --version)" "wt " "--version is accepted as a flag"
+
+# A renamed copy must not tell the user to run a command they do not have.
+cp "$WT" "$TMP/wtx"
+assert_contains "$("$TMP/wtx" --help)" "Usage: wtx" "a renamed executable names itself in usage"
+assert_contains "$("$TMP/wtx" nope 2>&1)" "see 'wtx --help'" "a renamed executable names itself in errors"
+# argv0 reaches sed as a replacement string, so it must not be able to inject.
+assert_contains "$(WT_NAME='a/b' "$WT" --help)" "Usage: wt" "an unsafe WT_NAME falls back to wt"
+
+# ============================================================
+# Test Suite: port blocks
+# ============================================================
+test_suite "port blocks"
+
+# wt carries `set -e`, which sourcing imports; without set +e the probe shell
+# dies on the first non-zero return instead of reporting it.
+pcheck() { bash -c "source '$WT'; set +e; $1"; }
+
+# Port 1 is privileged and nothing in the test environment listens there.
+assert_equals "1" "$(pcheck 'port_in_use 1 >/dev/null 2>&1; echo $?')" \
+    "port_in_use reports a port nothing listens on as free"
+# block_free must treat both registry shapes as occupied: the two-column rows
+# written before ranges existed, and the current three-column ones.
+printf 'old\t3100\nnew\t3200\t3209\n' > "$TMP/ports.tsv"
+assert_equals "1" "$(pcheck "block_free 3100 5 '$TMP/ports.tsv' >/dev/null 2>&1; echo \$?")" \
+    "a legacy single-port row still blocks its block"
+assert_equals "1" "$(pcheck "block_free 3205 5 '$TMP/ports.tsv' >/dev/null 2>&1; echo \$?")" \
+    "an overlapping range blocks"
+assert_equals "0" "$(pcheck "block_free 3400 5 '$TMP/ports.tsv' >/dev/null 2>&1; echo \$?")" \
+    "a free block is free"
+
+# ============================================================
+# Test Suite: link provisioning, cache sharing, JSON, hooks
+# ============================================================
+test_suite "provisioning modes and structured output"
+
+make_remote "$TMP/r2.git"
+# Seed a project whose .gitignore legalises the provisioning destinations and
+# whose tracked conf asks for a cache path and a small port block.
+seed="$TMP/seed2"
+git clone -q "$TMP/r2.git" "$seed" 2>/dev/null
+printf '.env\n.env.*\nnode_modules/\nshared.txt\nlinked.txt\n' > "$seed/.gitignore"
+mkdir -p "$seed/.dev"
+printf 'CACHE_PATHS=node_modules\nPORT_BLOCK_SIZE=4\n' > "$seed/.dev/worktree.conf"
+git -C "$seed" add -A && git -C "$seed" commit -q -m conf && git -C "$seed" push -q origin HEAD
+rm -rf "$seed"
+
+"$WT" init "$TMP/r2.git" "$TMP/p2" >/dev/null 2>&1
+cd "$TMP/p2" || exit 1
+printf 'shared\n' > local/shared/shared.txt
+printf 'linked\n' > local/link/linked.txt
+mkdir -p main/node_modules && printf 'cached\n' > main/node_modules/pkg.txt
+
+out=$("$WT" add feat --json 2>/dev/null)
+d="$TMP/p2/wt/feat"
+assert_contains "$out" '"port_start"' "add --json reports the allocated port block"
+assert_contains "$out" '"branch":"feat"' "add --json reports the branch"
+assert_file_exists "$d/shared.txt" "local/shared is copied"
+assert_is_symlink "$d/linked.txt" "local/link is symlinked, not copied"
+assert_file_exists "$d/node_modules/pkg.txt" "a declared cache path is shared into the worktree"
+assert_not_symlink "$d/node_modules" "cache sharing copies by default rather than linking"
+assert_contains "$(cat "$d/.env.worktree")" "WORKTREE_PORT_END" "the env carries the port block bounds"
+
+# PORT_BLOCK_SIZE=4, so the first block allocated runs 3100-3103 rather than
+# handing out a single port.
+assert_contains "$(cat state/ports.tsv)" "3100	3103" "the block size from the tracked conf is honoured"
+
+assert_contains "$("$WT" list --json 2>/dev/null)" '"worktrees"' "list --json emits a worktrees array"
+assert_not_contains "$("$WT" list --names 2>/dev/null)" "repo.git" \
+    "the bare repo is never reported as a worktree"
+assert_contains "$("$WT" doctor --json 2>/dev/null)" '"checks"' "doctor --json emits its checks"
+
+# A cache path the project does not ignore is refused, exactly like local/.
+# The conf is tracked, so the change has to reach origin before a new worktree
+# checks it out.
+printf 'CACHE_PATHS=notignored\n' > main/.dev/worktree.conf
+git -C main add -A >/dev/null 2>&1
+git -C main commit -q -m "chore: point cache at a non-ignored path" >/dev/null 2>&1
+git -C main push -q origin HEAD >/dev/null 2>&1
+mkdir -p main/notignored && printf 'x\n' > main/notignored/f
+out=$("$WT" add cache-bad 2>&1)
+assert_contains "$out" "refusing to share non-ignored cache path" \
+    "a non-ignored cache path is refused"
+assert_file_not_exists "$TMP/p2/wt/cache-bad" "a refused cache path rolls the worktree back"
+
+# Restore the conf: it is tracked, so leaving it pointing at a non-ignored
+# path would make every later `add` in this fixture fail the same way.
+printf 'CACHE_PATHS=node_modules\nPORT_BLOCK_SIZE=4\n' > main/.dev/worktree.conf
+rm -rf main/notignored
+git -C main add -A >/dev/null 2>&1
+git -C main commit -q -m "chore: restore cache conf" >/dev/null 2>&1
+git -C main push -q origin HEAD >/dev/null 2>&1
+
+# pre-* hooks gate the operation; post-* hooks report failure without
+# destroying the worktree.
+mkdir -p local/hooks
+printf '#!/usr/bin/env bash\nexit 1\n' > local/hooks/pre-add
+chmod +x local/hooks/pre-add
+"$WT" add blocked >/dev/null 2>&1
+assert_equals 1 $? "a failing pre-add hook fails the command"
+assert_file_not_exists "$TMP/p2/wt/blocked" "a failing pre-add hook creates no worktree"
+rm -f local/hooks/pre-add
+
+# pr:/mr: argument handling that needs no forge round-trip.
+assert_contains "$("$WT" add pr:abc 2>&1)" "not a request number" \
+    "a non-numeric request is rejected before any forge call"
+assert_contains "$(WT_FORGE=bitbucket "$WT" add pr:1 2>&1)" "WT_FORGE must be" \
+    "an unknown WT_FORGE is rejected"
+
+# ============================================================
+# Test Suite: post-pull, post-remove, async hooks
+# ============================================================
+test_suite "post-pull, post-remove, async hooks"
+
+printf '#!/usr/bin/env bash\necho pulled >> "%s/state/pulllog"\n' "$TMP/p2" > local/hooks/post-pull
+chmod +x local/hooks/post-pull
+"$WT" pull main >/dev/null 2>&1
+assert_contains "$(cat state/pulllog 2>/dev/null)" "pulled" "post-pull runs after a fast-forward"
+rm -f local/hooks/post-pull
+
+# The async form detaches and logs. A blocking hook writes to the caller's
+# stderr and never creates a log file, so the file's existence is what proves
+# the async path was taken.
+printf '#!/usr/bin/env bash\nsleep 1\necho async-done\n' > local/hooks/post-add.async
+chmod +x local/hooks/post-add.async
+"$WT" add asyncwt >/dev/null 2>&1
+assert_equals 0 $? "an async hook does not fail the command"
+logf="$TMP/p2/state/hooks/asyncwt-post-add.log"
+tries=0
+while [[ ! -s "$logf" && $tries -lt 60 ]]; do sleep 0.2; tries=$((tries + 1)); done
+assert_contains "$(cat "$logf" 2>/dev/null)" "async-done" \
+    "the async hook's output is captured under state/hooks"
+rm -f local/hooks/post-add.async
+
+printf '#!/usr/bin/env bash\nexit 0\n' > local/hooks/pre-add.async
+chmod +x local/hooks/pre-add.async
+assert_contains "$("$WT" add asyncpre 2>&1)" "pre-* hooks cannot run asynchronously" \
+    "an async pre-hook is refused, because a gate that does not block is not a gate"
+rm -f local/hooks/pre-add.async
+
+# post-remove fires from the root, after teardown, with the worktree gone.
+# shellcheck disable=SC2016  # $1 and $(basename) are for the hook script, not this shell
+printf '#!/usr/bin/env bash\nprintf "removed:%%s\\n" "$(basename "$1")" >> "%s/state/removelog"\n' \
+    "$TMP/p2" > local/hooks/post-remove
+chmod +x local/hooks/post-remove
+"$WT" remove feat >/dev/null 2>&1
+assert_equals 0 $? "remove succeeds with a post-remove hook"
+assert_contains "$(cat state/removelog 2>/dev/null)" "removed:feat" \
+    "post-remove runs after the worktree is gone"
+assert_file_not_exists "$TMP/p2/wt/feat" "post-remove does not resurrect the worktree"
+rm -f local/hooks/post-remove
+
+cd "$TMP" || exit 1
+
+# ============================================================
+# Test Suite: escaping, port probing, symlink resolution
+# ============================================================
+test_suite "escaping, port probing, symlink resolution"
+
+# A path or a branch name may legally contain either of these, and an
+# unescaped one terminates the JSON string early -- every --json consumer
+# then sees malformed output rather than an error.
+esc_bs="$(bash -c "source '$WT'; json_escape 'a\\b'")"
+assert_equals 'a\\b' "$esc_bs" "json_escape doubles a backslash"
+esc_q="$(bash -c "source '$WT'; json_escape 'say \"hi\"'")"
+assert_equals 'say \"hi\"' "$esc_q" "json_escape escapes a double quote"
+
+# The other C0 bytes are equally illegal raw inside a JSON string and have no
+# short escape, so they have to go out as \u00XX. A path may legally hold one.
+esc_ctl="$(bash -c "source '$WT'; json_escape \$'a\x08b'")"
+assert_equals 'a\u0008b' "$esc_ctl" "json_escape encodes a control byte as an escaped code point"
+if command -v jq >/dev/null 2>&1; then
+    printf '{"p":"%s"}' "$esc_ctl" | jq -e . >/dev/null 2>&1
+    assert_equals 0 $? "a control byte survives as parseable JSON"
+fi
+
+if command -v jq >/dev/null 2>&1; then
+    # End to end: git permits a double quote in a branch name.
+    cd "$TMP/p2" || exit 1
+    "$WT" add 'quote"branch' >/dev/null 2>&1
+    "$WT" list --json 2>/dev/null | jq -e . >/dev/null 2>&1
+    assert_equals 0 $? "list --json stays parseable when a branch name contains a quote"
+
+    # The deployed executable is a symlink, so the resolved path is the case
+    # that matters and the one version must report.
+    ln -sf "$WT" "$TMP/wt-link"
+    wt_expected="$(cd -P "$(dirname "$WT")" && pwd)/$(basename "$WT")"
+    assert_equals "$wt_expected" "$("$TMP/wt-link" version --json 2>/dev/null | jq -r .path)" \
+        "version resolves a symlinked executable back to the real file"
+    cd "$TMP" || exit 1
+else
+    echo "  (jq not installed -- skipping the --json parseability and symlink checks)"
+fi
+
+# port_in_use's free branch is covered by the port-block suite; this is the
+# branch the probe exists for. Binding a socket needs a helper that is not on
+# every platform CI covers, so it skips rather than fails when absent.
+probe_port=39871
+listener_pid=""
+if command -v perl >/dev/null 2>&1; then
+    # A deep backlog, because nothing ever accepts: every probe leaves its
+    # connection queued, and a backlog of 1 would refuse the second one.
+    perl -MIO::Socket::INET -e '
+        my $s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => $ARGV[0],
+                                      Listen => 128, ReuseAddr => 1) or exit 1;
+        sleep 30;
+    ' "$probe_port" &
+    listener_pid=$!
+elif command -v socat >/dev/null 2>&1; then
+    socat TCP-LISTEN:"$probe_port",bind=127.0.0.1,reuseaddr,fork /dev/null &
+    listener_pid=$!
+fi
+
+if [[ -n "$listener_pid" ]]; then
+    tries=0
+    until bash -c "source '$WT'; port_in_use $probe_port" 2>/dev/null || [[ $tries -ge 50 ]]; do
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    if bash -c "source '$WT'; port_in_use $probe_port" 2>/dev/null; then
+        assert_equals "0" "$(bash -c "source '$WT'; set +e; port_in_use $probe_port; echo \$?")" \
+            "port_in_use detects a real listener"
+        printf 'other\t1\t2\n' > "$TMP/probe.tsv"
+        assert_equals "1" "$(bash -c "source '$WT'; set +e; block_free $probe_port 2 '$TMP/probe.tsv' >/dev/null 2>&1; echo \$?")" \
+            "block_free rejects a block containing a listening port"
+    else
+        echo "  (could not bind $probe_port -- skipping the real-listener probe check)"
+    fi
+    kill "$listener_pid" 2>/dev/null || true
+    wait "$listener_pid" 2>/dev/null || true
+else
+    echo "  (no perl or socat -- skipping the real-listener probe check)"
+fi
+
+# Portable complement: stubbing the probe covers block_free's rejection path
+# even where nothing can bind a socket.
+printf 'other\t1\t2\n' > "$TMP/probe.tsv"
+assert_equals "1" \
+    "$(bash -c "source '$WT'; set +e; port_in_use() { [[ \$1 == 3402 ]]; }; block_free 3400 5 '$TMP/probe.tsv' >/dev/null 2>&1; echo \$?")" \
+    "block_free rejects a block whose middle port is busy"
+
+# ============================================================
+# Test Suite: prune
+# ============================================================
+test_suite "prune"
+
+cd "$TMP/p2" || exit 1
+"$WT" add prunable >/dev/null 2>&1
+assert_contains "$("$WT" list --names 2>/dev/null)" "prunable" "the worktree is registered before pruning"
+
+# Deleting the directory outside git leaves the administrative entry behind,
+# which is the only thing prune exists to clear.
+rm -rf "$TMP/p2/wt/prunable"
+assert_contains "$("$WT" list --names 2>/dev/null)" "prunable" \
+    "a directory deleted outside git stays registered"
+
+"$WT" prune >/dev/null 2>&1
+assert_equals 0 $? "prune succeeds"
+assert_not_contains "$("$WT" list --names 2>/dev/null)" "prunable" \
+    "prune clears the stale administrative entry"
+
+# prune is git's cleanup, not wt's: it knows nothing about the port registry,
+# so a worktree deleted outside `remove` keeps its block. Pinned so the day
+# that changes is a deliberate decision rather than a surprise.
+assert_contains "$(cat "$TMP/p2/state/ports.tsv")" "prunable" \
+    "prune leaves the port block allocated, because only remove releases it"
+
+# ...which is what doctor is for: nothing else compares the registry against
+# the worktrees that actually exist, so the pool would erode silently.
+out=$("$WT" doctor 2>&1)
+assert_not_equals 0 $? "doctor fails while a port reservation is orphaned"
+assert_contains "$out" "orphaned port reservation: prunable" \
+    "doctor names the orphaned reservation"
+assert_contains "$out" "ports.tsv" "doctor points at the registry to fix"
+
+if command -v jq >/dev/null 2>&1; then
+    assert_contains "$("$WT" doctor --json 2>/dev/null | jq -r '.checks[].detail')" \
+        "orphaned port reservation" "doctor --json carries the orphan finding too"
+fi
+
+# Releasing it by hand clears the finding, which proves the check tracks the
+# registry rather than reporting unconditionally.
+grep -v '^prunable' "$TMP/p2/state/ports.tsv" > "$TMP/p2/state/ports.tsv.tmp"
+mv "$TMP/p2/state/ports.tsv.tmp" "$TMP/p2/state/ports.tsv"
+assert_contains "$("$WT" doctor 2>&1)" "no orphaned reservations" \
+    "doctor reports a clean registry once the block is released"
+
+out=$("$WT" prune extra 2>&1)
+assert_not_equals 0 $? "prune rejects an argument"
+assert_contains "$out" "usage:" "prune's arity error shows the synopsis"
+
+cd "$TMP" || exit 1
+
+# ============================================================
+# Test Suite: request refs, rollback safety, pre-sync under --all
+# ============================================================
+test_suite "request refs, rollback safety, pre-sync under --all"
+
+cd "$TMP/p2" || exit 1
+
+# A request opened from a fork has no refs/heads/<branch> on origin at all,
+# only the forge's request ref. Simulated exactly: the commit is published as
+# refs/pull/1/head and under no branch name anywhere.
+git -C main commit -q --allow-empty -m "feat: the revision under review"
+fork_sha="$(git -C main rev-parse HEAD)"
+git -C main push -q origin "HEAD:refs/pull/1/head"
+git -C main reset --hard -q HEAD~1
+
+# The origin here is a local path, which no hostname heuristic recognises.
+# Installed CLIs are a property of the machine, not the repository, so an
+# unrecognised host must demand configuration rather than guess from them.
+out=$("$WT" add pr:1 2>&1)
+assert_not_equals 0 $? "an unrecognised origin host fails rather than guessing the forge"
+assert_contains "$out" "WT_FORGE" "the failure names the configuration that resolves it"
+
+WT_FORGE=github "$WT" add pr:1 >/dev/null 2>&1
+assert_equals 0 $? "a request whose branch exists only as a fork ref still resolves"
+assert_dir_exists "$TMP/p2/wt/pr-1" "the request worktree is created under a pr-N name"
+assert_equals "$fork_sha" "$(git -C "$TMP/p2/wt/pr-1" rev-parse HEAD 2>/dev/null)" \
+    "the worktree is pinned to the request head, not to the default branch"
+
+# Re-adding a request whose head has moved must not silently reuse the branch
+# left behind by an earlier remove: that checks out the revision the request
+# used to be, which is the opposite of the guarantee.
+git -C main commit -q --allow-empty -m "feat: a newer revision under review"
+fork_sha2="$(git -C main rev-parse HEAD)"
+git -C main push -q -f origin "HEAD:refs/pull/1/head"
+git -C main reset --hard -q HEAD~1
+"$WT" remove pr-1 >/dev/null 2>&1   # deliberately without --branch
+out=$(WT_FORGE=github "$WT" add pr:1 2>&1)
+assert_not_equals 0 $? "re-adding a moved request refuses the stale local branch"
+assert_contains "$out" "is now at" "the refusal names both revisions"
+assert_contains "$out" "branch -D pr-1" "the refusal prints the command that clears it"
+
+# Once the stale branch is gone the new revision checks out.
+git --git-dir="$TMP/p2/repo.git" branch -D pr-1 >/dev/null 2>&1
+WT_FORGE=github "$WT" add pr:1 >/dev/null 2>&1
+assert_equals "$fork_sha2" "$(git -C "$TMP/p2/wt/pr-1" rev-parse HEAD 2>/dev/null)" \
+    "the recreated worktree is at the updated request head"
+
+# [base] cannot mean anything for a request: silently honouring it would
+# produce a tree that is not the revision under review.
+out=$(WT_FORGE=github "$WT" add pr:1 main 2>&1)
+assert_not_equals 0 $? "a request plus an explicit base is refused"
+assert_contains "$out" "cannot be combined" "the refusal explains why base is meaningless here"
+
+# Rollback must not delete a branch this invocation did not create. Otherwise
+# a bad provisioning path destroys unpushed commits on an existing branch.
+git --git-dir="$TMP/p2/repo.git" branch keepme main 2>/dev/null
+printf 'x\n' > local/shared/notignored.txt
+"$WT" add keepme >/dev/null 2>&1
+assert_not_equals 0 $? "add fails when a provisioned file is not gitignored"
+assert_file_not_exists "$TMP/p2/wt/keepme" "the half-made worktree is rolled back"
+git --git-dir="$TMP/p2/repo.git" show-ref --verify --quiet refs/heads/keepme
+assert_equals 0 $? "rollback preserves a branch that already existed"
+
+# The mirror image: a branch this invocation did create is still cleaned up,
+# so the guard did not simply disable rollback.
+"$WT" add brandnew >/dev/null 2>&1
+git --git-dir="$TMP/p2/repo.git" show-ref --verify --quiet refs/heads/brandnew
+assert_not_equals 0 $? "rollback still deletes a branch it created itself"
+rm -f local/shared/notignored.txt
+
+# pre-sync gates `sync <name>`; it must gate `sync --all` too, or the more
+# expansive command is the unguarded one.
+mkdir -p local/hooks
+printf '#!/usr/bin/env bash\nexit 1\n' > local/hooks/pre-sync
+chmod +x local/hooks/pre-sync
+out=$("$WT" sync --all 2>&1)
+assert_not_equals 0 $? "a failing pre-sync fails sync --all"
+assert_contains "$out" "pre-sync hook failed" "sync --all reports which gate refused"
+assert_contains "$out" "failed validation" "sync --all still reports an aggregate count"
+rm -f local/hooks/pre-sync
+
+cd "$TMP" || exit 1
+
+# ============================================================
+# Test Suite: port lock lifecycle
+# ============================================================
+test_suite "port lock lifecycle"
+
+cd "$TMP/p2" || exit 1
+lockpath="$TMP/p2/state/ports.lock"
+
+# The lock is a kernel flock, so the file's continued existence means
+# nothing: held or free is the only distinction, and the kernel frees it
+# when the holder dies -- any death, including kill -9.
+lock_is_free() {
+    (flock -n 9) 9>>"$1" 2>/dev/null
+}
+
+"$WT" add lockcheck >/dev/null 2>&1
+assert_equals "0" "$(lock_is_free "$lockpath"; echo $?)" "a normal run leaves the lock free"
+
+bash -c "source '$WT'; acquire_ports_lock '$lockpath' >/dev/null 2>&1; exit 1" >/dev/null 2>&1
+assert_equals "0" "$(lock_is_free "$lockpath"; echo $?)" "a run that exits non-zero leaves the lock free"
+
+# The case no userspace cleanup can cover, and the reason the lock is an
+# flock rather than a symlink protocol: SIGKILL runs no handler.
+bash -c "source '$WT'; acquire_ports_lock '$lockpath' >/dev/null 2>&1; kill -9 \$\$" >/dev/null 2>&1
+assert_equals "0" "$(lock_is_free "$lockpath"; echo $?)" "a run killed with SIGKILL leaves the lock free"
+
+# With no signal traps installed, default disposition terminates the process:
+# the command must not carry on mutating state after the caller stops it.
+bash -c "source '$WT'; acquire_ports_lock '$lockpath' >/dev/null 2>&1; kill -TERM \$\$; echo SURVIVED" \
+    > "$TMP/sigterm.out" 2>&1
+sig_status=$?
+assert_equals 143 "$sig_status" "SIGTERM yields a signal-derived exit status, not success"
+assert_not_contains "$(cat "$TMP/sigterm.out" 2>/dev/null)" "SURVIVED" \
+    "the process stops at the signal instead of continuing"
+assert_equals "0" "$(lock_is_free "$lockpath"; echo $?)" "a run killed with SIGTERM leaves the lock free"
+
+# Contention. The holder must outlive the acquirer's wait window (flock -w 5),
+# or the second acquirer simply waits it out and the refusal is never
+# exercised.
+bash -c "source '$WT'; acquire_ports_lock '$lockpath' >/dev/null 2>&1; sleep 30" &
+lock_holder=$!
+tries=0
+while lock_is_free "$lockpath" && [[ $tries -lt 40 ]]; do sleep 0.05; tries=$((tries + 1)); done
+
+out=$("$WT" doctor 2>&1)
+assert_contains "$out" "locked by a running process" "doctor distinguishes live contention"
+
+# Releasing the port block is part of remove's contract, so a remove that
+# cannot lock the registry must refuse before destroying anything, and a
+# direct release failure must be nonzero and loud rather than a silent
+# success that strands the reservation.
+out=$("$WT" remove lockcheck 2>&1)
+assert_not_equals 0 $? "remove fails when the registry cannot be locked"
+assert_contains "$out" "worktree left in place" "the refusal says nothing was removed"
+assert_dir_exists "$TMP/p2/wt/lockcheck" "the worktree survives a refused remove"
+assert_contains "$(cat state/ports.tsv)" "lockcheck" "the reservation survives a refused remove"
+
+rp_out="$(bash -c "source '$WT'; set +e; release_port '$TMP/p2' lockcheck 2>&1; echo status=\$?")"
+assert_contains "$rp_out" "status=1" "release_port propagates a lock failure as nonzero"
+assert_contains "$rp_out" "not released" "release_port names the reservation it left behind"
+
+kill "$lock_holder" 2>/dev/null || true
+wait "$lock_holder" 2>/dev/null || true
+assert_equals "0" "$(lock_is_free "$lockpath"; echo $?)" "the holder's death frees the lock"
+
+out=$("$WT" remove lockcheck 2>&1)
+assert_equals 0 $? "remove succeeds once the lock is free"
+assert_not_contains "$(cat state/ports.tsv)" "lockcheck" "remove releases the reservation"
+
+# A free block that is not aligned to PORT_RANGE_START must still be found:
+# unrelated listeners do not land on wt's block boundaries.
+printf 'a\t3100\t3104\nb\t3115\t3119\n' > "$TMP/unaligned.tsv"
+assert_equals "0" "$(bash -c "source '$WT'; set +e; block_free 3105 10 '$TMP/unaligned.tsv' >/dev/null 2>&1; echo \$?")" \
+    "an unaligned free range is recognised as free"
+
+# A symlink at the lock path is a leftover from the pre-flock scheme; opening
+# it would create a stray file named after its owner token, so it is refused
+# by name rather than followed.
+ln -sfn "999999:never_ran" "$lockpath"
+out=$("$WT" add legacyblocked 2>&1)
+assert_not_equals 0 $? "a legacy symlink at the lock path fails the command"
+assert_contains "$out" "older" "the failure attributes the symlink to the old scheme"
+out=$("$WT" doctor 2>&1)
+assert_not_equals 0 $? "doctor fails on a legacy symlink lock"
+assert_contains "$out" "symlink" "doctor names the legacy symlink"
+rm -f "$lockpath"
+
+# Anything else at the lock path that is not a regular file cannot be locked
+# and must be reported rather than timed out against.
+mkdir -p "$lockpath"
+out=$("$WT" add lockdirblocked 2>&1)
+assert_not_equals 0 $? "a non-file at the lock path fails the command"
+assert_contains "$out" "not a regular file" "the failure names the obstruction"
+out=$("$WT" doctor 2>&1)
+assert_not_equals 0 $? "doctor fails on a non-file lock path"
+assert_contains "$out" "not a regular file" "doctor names the obstruction too"
+rmdir "$lockpath"
+
+# ============================================================
+# Test Suite: provisioning failure propagation
+# ============================================================
+test_suite "provisioning failure propagation"
+
+# errexit is disabled inside a function evaluated as a condition, and every
+# caller runs these under `if ! ...`, so an unchecked copy failure would fall
+# through to `return 0` and report a partial worktree as good.
+shimdir="$TMP/shim"
+mkdir -p "$shimdir"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$shimdir/rsync"
+chmod +x "$shimdir/rsync"
+
+printf 'shared\n' > local/shared/shared.txt
+# shellcheck disable=SC2031  # the shimmed PATH is deliberate and scoped to this one call
+out=$(PATH="$shimdir:$PATH" "$WT" add copyfails 2>&1)
+assert_not_equals 0 $? "a failing copy fails add"
+assert_file_not_exists "$TMP/p2/wt/copyfails" "a failing copy rolls the worktree back"
+assert_not_contains "$(cat state/ports.tsv)" "copyfails" \
+    "a rolled-back worktree leaves no port reservation behind"
+rm -f "$shimdir/rsync"
+
+# Rollback releases the block directly, which is what keeps a failure between
+# allocation and the env write from stranding one.
+printf 'stranded\t3900\t3909\n' >> state/ports.tsv
+bash -c "source '$WT'; set +e; WT_MODE=orchestration WT_ROOT='$TMP/p2' WT_GIT_DIR='$TMP/p2/repo.git' \
+    rollback_add '$TMP/p2/wt/stranded' stranded 0" >/dev/null 2>&1
+assert_not_contains "$(cat state/ports.tsv)" "stranded" \
+    "rollback releases the slug's port reservation"
+
+cd "$TMP" || exit 1
 
 # ============================================================
 # Summary

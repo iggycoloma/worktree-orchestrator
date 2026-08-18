@@ -33,6 +33,7 @@ _wt() {
         'prune:clean up stale worktree administrative entries'
         'ignore:write a workspace .ignore so searches skip worktrees'
         'doctor:check layout, git version, pointers, and tooling'
+        'version:print the version and where this executable came from'
         'help:show help for a command'
     )
 
@@ -78,7 +79,11 @@ _wt() {
                 _values 'flag' '--branch[also delete the branch]'
             fi ;;
         list)
-            _values 'flag' '--names[print bare directory names, one per line]' ;;
+            _values 'flag' \
+                '--names[print bare directory names, one per line]' \
+                '--json[print one object with every worktree]' ;;
+        doctor|version)
+            _values 'flag' '--json[print structured output instead of log lines]' ;;
         ignore)
             # Target is any workspace directory, not a worktree name.
             _alternative \
@@ -87,7 +92,9 @@ _wt() {
         init)
             (( CURRENT == 4 )) && _files -/ ;;
         add)
-            (( CURRENT == 4 )) && _wt_refs ;;
+            _alternative \
+                'flags:flag:((--json:"print the created worktree as one object"))' \
+                'refs:base ref:{ (( CURRENT == 4 )) && _wt_refs }' ;;
         help)
             _describe -t commands 'wt command' commands ;;
     esac

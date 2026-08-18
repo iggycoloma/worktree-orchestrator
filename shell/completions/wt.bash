@@ -20,7 +20,7 @@ _wt() {
     cmd="${COMP_WORDS[1]:-}"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
-        candidates="init add go list path pull git sync container remove prune ignore doctor help"
+        candidates="init add go list path pull git sync container remove prune ignore doctor version help"
     else
         case "$cmd" in
             go|path|pull)
@@ -66,7 +66,7 @@ _wt() {
                     candidates="--branch"
                 fi ;;
             list)
-                candidates="--names" ;;
+                candidates="--names --json" ;;
             ignore)
                 # Target is any workspace directory, not a worktree name.
                 if [[ "$cur" == -* ]]; then
@@ -83,11 +83,19 @@ _wt() {
                 COMPREPLY=( $(compgen -d -- "$cur") )
                 return 0 ;;
             add)
-                # The name is new, so only the optional base ref completes.
-                [[ "$COMP_CWORD" -eq 3 ]] || return 0
-                candidates="$(_wt_branches)" ;;
+                # The name is new, so only the optional base ref and the
+                # output flag complete.
+                if [[ "$cur" == -* ]]; then
+                    candidates="--json"
+                elif [[ "$COMP_CWORD" -eq 3 ]]; then
+                    candidates="$(_wt_branches)"
+                else
+                    return 0
+                fi ;;
+            doctor|version)
+                candidates="--json" ;;
             help)
-                candidates="init add go list path pull git sync container remove prune ignore doctor" ;;
+                candidates="init add go list path pull git sync container remove prune ignore doctor version" ;;
             *)
                 return 0 ;;
         esac
