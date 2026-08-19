@@ -283,7 +283,7 @@ detect_mode() {
     fi
     local clone_root
     clone_root="$(find_clone_root)"
-    [[ -n "$clone_root" ]] || die "not inside a git repository or orchestration directory"
+    [[ -n "$clone_root" ]] || die "not inside a git repository or orchestration directory -- $WT_NAME resolves the repo by walking up from the current directory, never down; run it from inside the target repo, e.g. (cd <repo> && $WT_NAME add <name>)"
     WT_MODE="clone"
     WT_ROOT="$clone_root"
     WT_GIT_DIR="$clone_root/.git"
