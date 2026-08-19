@@ -982,6 +982,11 @@ cmd_init() {
         || log "warning: initial fetch failed; refs/remotes/origin/* will populate on the next 'git fetch origin'"
     if git --git-dir="$root/repo.git" rev-parse --verify --quiet "refs/remotes/origin/$default_branch" >/dev/null; then
         git --git-dir="$root/repo.git" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default_branch"
+        # A bare clone configures no upstream for any of the refs/heads/* it
+        # creates (git-clone(1) only does that for a non-bare checkout), so
+        # plain `git pull` in main/ would fail with "no tracking information".
+        git --git-dir="$root/repo.git" branch --quiet --set-upstream-to="origin/$default_branch" "$default_branch" \
+            || log "warning: could not set upstream for '$default_branch'"
     fi
     ensure_rel_flag
     # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
@@ -1111,7 +1116,7 @@ cmd_add() {
             ;;
     esac
 
-    local dest branch hook_status=0 created_branch=0
+    local dest branch hook_status=0 created_branch=0 track_flag=""
     # The name doubles as the branch when it is a legal ref (slashes fine,
     # e.g. user/CLK-943); otherwise the branch falls back to the slug.
     if git check-ref-format --branch "$name" >/dev/null 2>&1; then
@@ -1131,6 +1136,18 @@ cmd_add() {
     if git --git-dir="$WT_GIT_DIR" show-ref --verify --quiet "refs/heads/$branch"; then
         # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
         git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG "$dest" "$branch" >&2
+        # Branches inherited from the bare clone have no upstream (the
+        # new-branch arm below gets one from git's own autoSetupMerge when
+        # the base is a remote-tracking ref). Adopt origin/<branch> when it
+        # exists and nothing is configured, so plain `git pull` works.
+        # Skipped for a request: origin has no refs/heads/pr-N, so that
+        # upstream would fail every pull with "no such ref was fetched".
+        if [[ "$is_request" -eq 0 ]] \
+            && ! git --git-dir="$WT_GIT_DIR" config --get "branch.$branch.merge" >/dev/null \
+            && git --git-dir="$WT_GIT_DIR" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+            git --git-dir="$WT_GIT_DIR" branch --quiet --set-upstream-to="origin/$branch" "$branch" \
+                || log "warning: could not set upstream for '$branch'"
+        fi
     else
         # New branches start at the true remote head, not the head as of
         # the last fetch. Best-effort: an offline add still works.
@@ -1143,8 +1160,14 @@ cmd_add() {
                 || log "warning: fetch failed; basing '$branch' on last-known origin state"
         fi
         [[ -n "$base" ]] || base="$(default_base "$WT_GIT_DIR")"
-        # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
-        git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG -b "$branch" "$dest" "$base" >&2
+        # git's autoSetupMerge points the new branch at its base when that
+        # base is a remote-tracking ref. For origin/<default> that is what a
+        # plain `git pull` wants; for a request it configures an upstream
+        # origin cannot serve (it has no refs/heads/pr-N, and any
+        # `fetch --prune` deletes the request ref), so suppress it there.
+        [[ "$is_request" -eq 0 ]] || track_flag="--no-track"
+        # shellcheck disable=SC2086  # WT_REL_FLAG and track_flag are deliberately word-split
+        git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG $track_flag -b "$branch" "$dest" "$base" >&2
         created_branch=1
     fi
 

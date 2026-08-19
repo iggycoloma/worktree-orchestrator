@@ -254,6 +254,15 @@ assert_contains "$output" "no such worktree" "container exec resolves the worktr
 test_suite "orchestration mode"
 
 make_remote "$TMP/remote-orch.git"
+
+# A branch that exists on the remote before init: the bare clone copies it
+# into refs/heads/* with no upstream, exercising add's attach path below.
+git clone -q "$TMP/remote-orch.git" "$TMP/seed-inherited" 2>/dev/null
+git -C "$TMP/seed-inherited" switch -q -c inherited
+git -C "$TMP/seed-inherited" commit -q --allow-empty -m "feat: inherited"
+git -C "$TMP/seed-inherited" push -q origin inherited
+rm -rf "$TMP/seed-inherited"
+
 cd "$TMP" || exit 1
 root=$("$WT" init "$TMP/remote-orch.git" "$TMP/proj" 2>/dev/null)
 assert_equals "$TMP/proj" "$root" "wt init prints the orchestration root"
@@ -276,6 +285,12 @@ assert_equals '+refs/heads/*:refs/remotes/origin/*' "$refspec" \
 origin_head=$(git --git-dir="$TMP/proj/repo.git" symbolic-ref --short refs/remotes/origin/HEAD)
 assert_equals "origin/main" "$origin_head" "init points origin/HEAD at the default branch"
 
+# Bare clones configure no upstream for any branch, which would make a plain
+# `git pull` in main/ fail with "no tracking information".
+main_merge=$(git --git-dir="$TMP/proj/repo.git" config --get branch.main.merge)
+assert_equals "refs/heads/main" "$main_merge" \
+    "init sets an upstream for the default branch (bare clones have none)"
+
 # Plain `git fetch origin` must actually move origin/* -- the whole point
 # of the refspec. Advance the remote out-of-band, fetch, compare.
 git clone -q "$TMP/remote-orch.git" "$TMP/seed-fetch" 2>/dev/null
@@ -292,6 +307,14 @@ cd "$TMP/proj" || exit 1
 dest=$("$WT" add issue-123 2>/dev/null)
 assert_equals "$TMP/proj/wt/issue-123" "$dest" "orchestration worktrees land in wt/"
 assert_rel_pointer "$dest/.git" "orchestration pointer is relative into repo.git"
+
+# Attaching to a branch the bare clone brought along must adopt
+# origin/<branch>, for the same "no tracking information" reason as main/.
+"$WT" add inherited >/dev/null 2>&1
+inherited_merge=$(git --git-dir="$TMP/proj/repo.git" config --get branch.inherited.merge)
+assert_equals "refs/heads/inherited" "$inherited_merge" \
+    "attaching to a clone-inherited branch adopts origin/<branch> as upstream"
+"$WT" remove inherited >/dev/null 2>&1
 
 cd "$TMP/proj/wt/issue-123" || exit 1
 nested=$("$WT" add from-inside 2>/dev/null)
@@ -1340,6 +1363,8 @@ assert_equals 0 $? "a request whose branch exists only as a fork ref still resol
 assert_dir_exists "$TMP/p2/wt/pr-1" "the request worktree is created under a pr-N name"
 assert_equals "$fork_sha" "$(git -C "$TMP/p2/wt/pr-1" rev-parse HEAD 2>/dev/null)" \
     "the worktree is pinned to the request head, not to the default branch"
+assert_equals "" "$(git --git-dir="$TMP/p2/repo.git" config --get branch.pr-1.merge)" \
+    "a request branch gets no upstream (origin has no refs/heads/pr-N to pull)"
 
 # Re-adding a request whose head has moved must not silently reuse the branch
 # left behind by an earlier remove: that checks out the revision the request
