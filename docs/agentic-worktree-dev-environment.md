@@ -11,9 +11,14 @@ The amendments, decided 2026-08-02 (rationale and verification evidence in the p
   Verification status: the devcontainer CLI's `--mount-git-worktree-common-dir` is proven to reconstruct relative worktree structure for nested worktrees; the equivalent spike for this layout's `wt/x -> ../../repo.git/worktrees/x` is specified in the plan and gates per-worktree container support.
 - **Relative paths are mandatory:** `worktree.useRelativePaths = true` globally, and `wt add` passes `--relative-paths`.
   Required by the devcontainer CLI's common-dir mounting, and makes worktrees relocatable across the host/container mount boundary.
-  Git version floor: 2.48.
+  Git version floor: 2.48, tracked canonically as `DOTFILES_MIN_GIT` in `bootstrap/versions.sh` (standalone scripts inline it; `tests/test-consistency.sh` keeps the copies in sync).
 - **Hooks (supersedes section 9's `core.hooksPath` advice):** no project ever sets repository-local `core.hooksPath` -- doing so silently disables the globally deployed secret-scanning and commit-message hooks.
-  The global `post-checkout` hook delegates to a repo-local `post-checkout.local`, resolved via `--git-common-dir`.
+  Each global hook delegates to a repo-local `<hook>.local`, resolved via `--git-common-dir`.
+  A project with *tracked* hooks opts in once with `git config dotfiles.projectHooks true`;
+  the global dispatchers (`pre-commit`, `commit-msg`, `pre-push`, `post-checkout`) then chain the current worktree's `.githooks/<hook>`, resolved via `--show-toplevel`.
+  The flag lives in the shared `repo.git` config, so one opt-in covers the main checkout, every worktree, and a container the repository is bind-mounted into;
+  it is read with `--local` only, so a global or system-level setting has no effect -- `.githooks/` arrives with a clone, and the trust grant must live in the one file a clone cannot ship;
+  hook types outside those four dispatchers do not run while the global `core.hooksPath` is active.
 - **`.worktreeinclude` (updates section 3):** now implemented natively by Claude Code, not only by third-party tools.
   Still treated as an optional adapter: it is per-harness, sources from the main checkout rather than a central store, and is not processed when a `WorktreeCreate` hook is configured.
 - **Execution model (extends section 8):** the primary mode runs the agent on the host with the container as a pure build/test executor via `devcontainer up`/`exec`; the in-container mode (GitHub Codespaces) remains fully supported.

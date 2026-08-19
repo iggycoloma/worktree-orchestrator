@@ -46,7 +46,11 @@
 
   // Features to install (alternative to manual package installation)
   "features": {
-    "ghcr.io/devcontainers/features/git:1": {},
+    // "latest" builds git from source; the default os-provided git can
+    // predate 2.48, which extensions.relativeWorktrees (wt worktrees) needs
+    "ghcr.io/devcontainers/features/git:1": {
+      "version": "latest"
+    },
     "ghcr.io/devcontainers/features/github-cli:1": {}
   },
 

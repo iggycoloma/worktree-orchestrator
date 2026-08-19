@@ -296,18 +296,24 @@ version_at_least() {
     [[ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | head -1)" == "$want" ]]
 }
 
-# --relative-paths landed in git 2.48; older git errors on the flag. The
-# packages layer keeps git current (git-core PPA); this guard keeps wt
+# Minimum git for relative worktree pointers (worktree add --relative-paths
+# / worktree.useRelativePaths). Canonical value: bootstrap/versions.sh
+# (DOTFILES_MIN_GIT); inlined here because wt deploys as a standalone
+# script. tests/test-consistency.sh keeps the copies in sync.
+WT_MIN_GIT="2.48.0"
+
+# --relative-paths landed in git $WT_MIN_GIT; older git errors on the flag.
+# The packages layer keeps git current (git-core PPA); this guard keeps wt
 # usable when it is not: pointers degrade to absolute, per-worktree
 # containers stop working (doctor flags it), everything else survives.
 # Sets WT_REL_FLAG once and warns once on the degraded path.
 ensure_rel_flag() {
     [[ -z "${WT_REL_FLAG+x}" ]] || return 0
-    if version_at_least "$(git --version | awk '{print $3}')" "2.48.0"; then
+    if version_at_least "$(git --version | awk '{print $3}')" "$WT_MIN_GIT"; then
         WT_REL_FLAG="--relative-paths"
     else
         WT_REL_FLAG=""
-        log "warning: git < 2.48 -- creating worktree with an absolute pointer (per-worktree containers need relative paths)"
+        log "warning: git < $WT_MIN_GIT -- creating worktree with an absolute pointer (per-worktree containers need relative paths)"
     fi
 }
 
@@ -1708,10 +1714,10 @@ cmd_doctor() {
     d_ok "root: $WT_ROOT"
 
     git_version="$(git --version | awk '{print $3}')"
-    if version_at_least "$git_version" "2.48.0"; then
-        d_ok "git $git_version (>= 2.48: relative worktree paths available)"
+    if version_at_least "$git_version" "$WT_MIN_GIT"; then
+        d_ok "git $git_version (>= $WT_MIN_GIT: relative worktree paths available)"
     else
-        d_warn "git $git_version < 2.48 -- worktrees get absolute pointers; per-worktree containers will not work"
+        d_warn "git $git_version < $WT_MIN_GIT -- worktrees get absolute pointers; per-worktree containers will not work"
         failures=$((failures + 1))
     fi
 
