@@ -27,14 +27,25 @@ _wt() {
                 [[ "$COMP_CWORD" -eq 2 ]] || return 0
                 candidates="$(_wt_names)" ;;
             container)
-                # up|exec, then the name; past that the words belong to the
-                # container command.
+                # up|exec, then the name and --config; past -- the words
+                # belong to the container command, and a --config value is
+                # a path with no wt candidates.
+                local i
+                for ((i = 2; i < COMP_CWORD; i++)); do
+                    [[ "${COMP_WORDS[i]}" == "--" ]] && return 0
+                done
                 if [[ "$COMP_CWORD" -eq 2 ]]; then
                     candidates="up exec"
-                elif [[ "$COMP_CWORD" -eq 3 ]]; then
-                    candidates="$(_wt_names)"
-                else
+                elif [[ "${COMP_WORDS[COMP_CWORD-1]}" == "--config" ]]; then
+                    # -o filenames appends / to directories so descent works
+                    compopt -o filenames 2>/dev/null
+                    # shellcheck disable=SC2207
+                    COMPREPLY=( $(compgen -f -- "$cur") )
                     return 0
+                elif [[ "$COMP_CWORD" -eq 3 ]]; then
+                    candidates="--config $(_wt_names)"
+                else
+                    candidates="--config"
                 fi ;;
             git)
                 if [[ "$COMP_CWORD" -eq 2 ]]; then

@@ -162,8 +162,14 @@ NOTE
 NOTE
         ;;
         container) cat <<'NOTE'
-  @WT@ container up [name]                start the dev container (default: main)
-  @WT@ container exec <name> -- <cmd...>  run a command in the container
+  @WT@ container up [name] [--config <path>]      start the dev container (default: main)
+  @WT@ container exec <name> [--config <path>] -- <cmd...>
+                                          run a command in the container
+
+  --config selects a devcontainer.json when the project ships more than one
+  (e.g. .devcontainer/<variant>/devcontainer.json); a relative path resolves
+  against the worktree. Without it the devcontainer CLI applies its standard
+  lookup. Pass the same --config to up and exec so both target one container.
 
   Everything after -- is passed to the container verbatim, including flags:
   '@WT@ container exec api -- pytest --help' runs pytest's help, not @WT@'s.
@@ -846,6 +852,19 @@ dc_common_flags() {
         "$dest" "$(project_id)" "$slug"
 }
 
+# Optional devcontainer.json override for projects that ship more than one
+# (.devcontainer/<variant>/devcontainer.json -- the CLI's default lookup
+# only ever finds .devcontainer/devcontainer.json). A relative path resolves
+# against the worktree, not the cwd, so one invocation shape works from
+# anywhere; empty input passes through to the CLI's default lookup.
+resolve_devcontainer_config() {
+    local dest="$1" config="$2"
+    [[ -n "$config" ]] || return 0
+    [[ "$config" == /* ]] || config="$dest/$config"
+    [[ -f "$config" ]] || die "no such devcontainer config: $config"
+    printf '%s\n' "$config"
+}
+
 # Personal dotfiles for CLI-launched containers, matching VS Code behavior.
 # Explicit override via WT_DOTFILES_REPOSITORY; falls back to ~/.dotfiles'
 # origin. CLI flags, not devcontainer.json: personal config never belongs
@@ -888,16 +907,28 @@ cmd_container() {
 }
 
 cmd_container_up() {
-    check_args container 0 1 "$@"
+    local name="" config=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config)
+                [[ -n "${2:-}" ]] || die "usage: $(command_synopsis container)"
+                config="$2"; shift ;;
+            -*) die "unknown option: $1 (see '$WT_NAME container --help')" ;;
+            *)  [[ -z "$name" ]] || die "usage: $(command_synopsis container)"; name="$1" ;;
+        esac
+        shift
+    done
     detect_mode
     local dest slug repo
-    dest="$(resolve_or_default "${1:-}")"
+    dest="$(resolve_or_default "$name")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
+    config="$(resolve_devcontainer_config "$dest" "$config")"
     require_host_docker
     slug="$(basename "$dest")"
 
     local flags=()
     while IFS= read -r line; do flags+=("$line"); done < <(dc_common_flags "$dest" "$slug")
+    [[ -n "$config" ]] && flags+=(--config "$config")
     repo="$(dotfiles_repo)"
     [[ -n "$repo" ]] && flags+=(--dotfiles-repository "$repo")
 
@@ -905,12 +936,21 @@ cmd_container_up() {
 }
 
 cmd_container_exec() {
-    local name="${1:-}"
-    require_name container "$name"
-    shift
+    local name="" config=""
     # The separator is mandatory: it is what keeps the container command's
     # flags out of wt's own parsing, so its absence is a usage error rather
-    # than a guess.
+    # than a guess. Only wt's own flags may appear before it.
+    while [[ $# -gt 0 && "$1" != "--" ]]; do
+        case "$1" in
+            --config)
+                [[ -n "${2:-}" && "${2:-}" != "--" ]] || die "usage: $(command_synopsis container)"
+                config="$2"; shift ;;
+            -*) die "unknown option: $1 (see '$WT_NAME container --help')" ;;
+            *)  [[ -z "$name" ]] || die "usage: $(command_synopsis container)"; name="$1" ;;
+        esac
+        shift
+    done
+    require_name container "$name"
     [[ "${1:-}" == "--" ]] || die "usage: $(command_synopsis container)"
     shift
     [[ $# -gt 0 ]] || die "usage: $(command_synopsis container)"
@@ -918,11 +958,13 @@ cmd_container_exec() {
     local dest slug
     dest="$(resolve_worktree "$name")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
+    config="$(resolve_devcontainer_config "$dest" "$config")"
     require_host_docker
     slug="$(basename "$dest")"
 
     local flags=()
     while IFS= read -r line; do flags+=("$line"); done < <(dc_common_flags "$dest" "$slug")
+    [[ -n "$config" ]] && flags+=(--config "$config")
 
     # The CLI does not copy host gitconfig (unlike the VS Code extension),
     # so commits in-container need identity injected from the host.

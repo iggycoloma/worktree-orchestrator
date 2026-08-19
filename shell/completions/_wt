@@ -57,14 +57,25 @@ _wt() {
                 _normal
             fi ;;
         container)
-            # up|exec, then the name; past that the words belong to the
-            # container command.
+            # up|exec, then the name and --config; past -- the words belong
+            # to the container command.
+            local sep
+            sep=${words[(i)--]}
+            if (( sep < CURRENT )); then
+                return 0
+            fi
             if (( CURRENT == 3 )); then
                 _values 'container command' \
                     'up[start the dev container (default: main)]' \
                     'exec[run a command in the container]'
+            elif [[ "${words[CURRENT-1]}" == "--config" ]]; then
+                _files -g '*.json*'
             elif (( CURRENT == 4 )); then
-                _wt_worktrees
+                _alternative \
+                    'flags:flag:((--config:"pick a devcontainer.json"))' \
+                    'worktrees:worktree:_wt_worktrees'
+            else
+                _values 'flag' '--config[pick a devcontainer.json]'
             fi ;;
         sync)
             # Name and flags are order-free; offer whichever remain.

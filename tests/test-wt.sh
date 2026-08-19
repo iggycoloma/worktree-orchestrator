@@ -489,6 +489,33 @@ output=$("$WT" container exec nonexistent -- true 2>&1)
 assert_not_equals 0 $? "container exec fails on an unknown worktree"
 assert_contains "$output" "no such worktree" "container exec resolves the name before the docker check"
 
+# --config parses before any docker/CLI requirement: a missing value is a
+# usage error, an unknown flag names itself, and a missing file dies with
+# the resolved path.
+output=$("$WT" container up provisioned --config 2>&1)
+assert_not_equals 0 $? "container up --config without a value is a usage error"
+assert_contains "$output" "usage: wt container" "missing --config value prints the synopsis"
+output=$("$WT" container up provisioned --bogus 2>&1)
+assert_not_equals 0 $? "container up rejects unknown options"
+assert_contains "$output" "unknown option" "unknown container option names itself"
+output=$("$WT" container up provisioned --config .devcontainer/nope/devcontainer.json 2>&1)
+assert_not_equals 0 $? "container up fails on a missing config file"
+assert_contains "$output" "no such devcontainer config" "missing config is reported before the docker check"
+output=$("$WT" container exec provisioned --config .devcontainer/nope/devcontainer.json -- true 2>&1)
+assert_not_equals 0 $? "container exec fails on a missing config file"
+assert_contains "$output" "no such devcontainer config" "exec validates --config like up"
+output=$("$WT" container exec provisioned --config -- true 2>&1)
+assert_not_equals 0 $? "container exec --config without a value is a usage error"
+assert_contains "$output" "usage: wt container" "exec missing --config value prints the synopsis"
+
+# A relative --config resolves against the worktree, not the cwd: the file
+# exists only under the worktree, so getting past config validation (to the
+# docker/CLI gate) proves the resolution base.
+mkdir -p "$TMP/proj/wt/provisioned/.devcontainer/ci"
+printf '{}' > "$TMP/proj/wt/provisioned/.devcontainer/ci/devcontainer.json"
+output=$("$WT" container up provisioned --config .devcontainer/ci/devcontainer.json 2>&1)
+assert_not_contains "$output" "no such devcontainer config" "relative --config resolves against the worktree"
+
 if [[ -f /.dockerenv ]]; then
     output=$("$WT" container up provisioned 2>&1)
     status=$?
@@ -867,6 +894,11 @@ out=$(complete_wt wt container "")
 assert_equals "up exec" "${out//$'\n'/ }" "wt container completes its two subcommands"
 out=$(complete_wt wt container up "")
 assert_contains "$out" "main" "wt container up completes worktree names"
+assert_contains "$out" "--config" "wt container up offers --config at the name position"
+out=$(complete_wt wt container up main "")
+assert_equals "--config" "$out" "wt container up past the name offers only --config"
+out=$(complete_wt wt container exec main -- tool "")
+assert_equals "" "$out" "container completion stays silent past --"
 
 out=$(complete_wt wt sync "")
 assert_contains "$out" "--diff" "wt sync offers --diff"
