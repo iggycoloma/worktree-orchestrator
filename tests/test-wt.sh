@@ -15,6 +15,10 @@ WT="$DOTFILES_DIR/bin/wt"
 source "$SCRIPT_DIR/test-framework.sh"
 
 TMP="$(mktemp -d)"
+# git reports worktree paths with symlinks resolved (docs/wt-maintenance.md),
+# and on macOS mktemp returns /var/... which is a symlink to /private/var/...,
+# so unresolved expectations would never match wt's output. Resolve once here.
+TMP="$(cd "$TMP" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
 
 export GIT_CONFIG_NOSYSTEM=1
