@@ -21,8 +21,9 @@ It is a single Bash script (3.2 compatible, macOS `/bin/bash` included) with no 
 
 ## Install
 
-Requirements: bash 3.2+ and git.
+Requirements: bash 3.2+, git, and rsync.
 Git 2.48+ is recommended (relative worktree pointers; older versions degrade with a warning).
+Orchestration mode also needs flock for the port registry -- Linux has it via util-linux, macOS needs `brew install flock`.
 Optional: docker plus the devcontainer CLI for `wt container`, jq for consuming `--json` output, zsh for zsh completions.
 
 ```bash
