@@ -6,7 +6,7 @@ persistent state across container rebuilds.
 
 ```bash
 mkdir -p .devcontainer
-cp ~/.dotfiles/.devcontainer/example/devcontainer.json .devcontainer/
+cp path/to/worktree-orchestrator/examples/devcontainer/devcontainer.json .devcontainer/
 ```
 
 Then:

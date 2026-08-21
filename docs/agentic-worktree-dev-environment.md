@@ -3,7 +3,7 @@
 ## Status
 
 Original design, adopted with amendments.
-The implementation plan is [`planning/2026-08-02-agentic-worktree-system.md`](../planning/2026-08-02-agentic-worktree-system.md); where the two disagree, the plan wins.
+The implementation plan is [`planning/2026-08-02-agentic-worktree-system.md`](planning/2026-08-02-agentic-worktree-system.md); where the two disagree, the plan wins.
 The amendments, decided 2026-08-02 (rationale and verification evidence in the plan):
 
 - **Layout: adopted as designed** -- the section 2 orchestration directory (bare `repo.git/` + `local/` + `state/` + `main/` + `wt/`) stands.

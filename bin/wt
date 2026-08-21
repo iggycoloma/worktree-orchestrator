@@ -4,7 +4,7 @@ set -euo pipefail
 # wt -- worktree operations for the agentic dev environment.
 #
 # Two layouts, detected automatically (docs/agentic-worktree-dev-environment.md,
-# planning/2026-08-02-agentic-worktree-system.md):
+# docs/planning/2026-08-02-agentic-worktree-system.md):
 #
 #   orchestration mode   <root>/repo.git (bare) + local/ + state/ + main/ + wt/<slug>
 #   clone mode           ordinary clone; worktrees at <parent>/<repo>-worktrees/<leaf>
