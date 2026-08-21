@@ -20,7 +20,7 @@ _wt() {
     cmd="${COMP_WORDS[1]:-}"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
-        candidates="init add go list path pull git sync container remove prune ignore doctor version help"
+        candidates="init convert add go list path pull git sync container remove prune ignore doctor version help"
     else
         case "$cmd" in
             go|path|pull)
@@ -105,8 +105,10 @@ _wt() {
                 fi ;;
             doctor|version)
                 candidates="--json" ;;
+            convert)
+                candidates="--dry-run" ;;
             help)
-                candidates="init add go list path pull git sync container remove prune ignore doctor version" ;;
+                candidates="init convert add go list path pull git sync container remove prune ignore doctor version" ;;
             *)
                 return 0 ;;
         esac

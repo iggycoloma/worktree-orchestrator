@@ -21,6 +21,7 @@ _wt() {
     local -a commands
     commands=(
         'init:create an orchestration dir (bare clone + local/ state/ main/ wt/)'
+        'convert:convert the enclosing clone into an orchestration dir, in place'
         'add:create a worktree'
         'go:cd into a worktree'
         'list:list worktrees for the current project'
@@ -95,6 +96,8 @@ _wt() {
                 '--json[print one object with every worktree]' ;;
         doctor|version)
             _values 'flag' '--json[print structured output instead of log lines]' ;;
+        convert)
+            _values 'flag' '--dry-run[print the plan and change nothing]' ;;
         ignore)
             # Target is any workspace directory, not a worktree name.
             _alternative \
