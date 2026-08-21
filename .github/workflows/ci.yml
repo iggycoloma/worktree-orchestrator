@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -x -P SCRIPTDIR bin/wt tests/test-wt.sh tests/test-framework.sh completions/wt.bash
+        run: shellcheck -x -P SCRIPTDIR bin/wt install.sh tests/test-wt.sh tests/test-framework.sh completions/wt.bash
 
   test:
     strategy:

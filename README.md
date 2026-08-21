@@ -27,14 +27,13 @@ Orchestration mode also needs flock for the port registry -- Linux has it via ut
 Optional: docker plus the devcontainer CLI for `wt container`, jq for consuming `--json` output, zsh for zsh completions.
 
 ```bash
-git clone git@github.com:iggycoloma/worktree-orchestrator.git
-cd worktree-orchestrator
-make install
+curl -fsSL https://raw.githubusercontent.com/iggycoloma/worktree-orchestrator/main/install.sh | bash
 ```
 
-`make install` symlinks `wt` and the completions under `~/.local/bin` and `~/.local/share`
-(override with `make install PREFIX=/somewhere`),
-so a later `git pull` in the clone updates the installed tool in place.
+This clones the repo to `~/.local/share/worktree-orchestrator` and symlinks `wt` and the completions under `~/.local/bin` and `~/.local/share`
+(override with the `WT_ORCH_DIR`, `WT_ORCH_REPO`, and `PREFIX` environment variables).
+Re-running it fast-forwards the clone, so it doubles as the update command.
+From an existing checkout, `./install.sh` (or `make install`) installs from that checkout instead of cloning a second copy.
 Make sure `$PREFIX/bin` is on your `PATH`.
 `make uninstall` removes the symlinks.
 
