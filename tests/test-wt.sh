@@ -1275,7 +1275,10 @@ assert_equals "0" "$(lock_is_free "$lockpath"; echo $?)" "a run killed with SIGT
 # Contention. The holder must outlive the acquirer's wait window (flock -w 5),
 # or the second acquirer simply waits it out and the refusal is never
 # exercised.
-bash -c "source '$WT'; acquire_ports_lock '$lockpath' >/dev/null 2>&1; sleep 30" &
+# exec, not a plain sleep: modern bash replaces itself with the trailing
+# command anyway, but bash 3.2 forks it, and then kill hits the shell while
+# the orphaned sleep keeps lock fd 9 open for the full 30 seconds.
+bash -c "source '$WT'; acquire_ports_lock '$lockpath' >/dev/null 2>&1; exec sleep 30" &
 lock_holder=$!
 tries=0
 while lock_is_free "$lockpath" && [[ $tries -lt 40 ]]; do sleep 0.05; tries=$((tries + 1)); done
