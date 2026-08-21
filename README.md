@@ -18,6 +18,7 @@ It is a single Bash script (3.2 compatible, macOS `/bin/bash` included) with no 
 - **Clone mode** -- any ordinary clone:
   worktrees go to a sibling directory `<parent>/<repo>-worktrees/<leaf>`, without provisioning.
   No setup required; `wt add` just works.
+  `wt convert` upgrades a clone to an orchestration dir in place, preserving branches, stashes, untracked files, and existing worktrees.
 
 ## Install
 
@@ -49,6 +50,7 @@ autoload -Uz compinit && compinit
 
 ```text
 init <url> <dir>            create an orchestration dir (bare clone + local/ state/ main/ wt/)
+convert [--dry-run]         convert the enclosing clone into an orchestration dir, in place
 add <name|pr:N> [base]      create a worktree (+ provision local files in orchestration mode)
 go [name]                   cd into a worktree (no name: the stable checkout)
 list [--names|--json]       list worktrees for the current project

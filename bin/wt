@@ -14,7 +14,7 @@ set -euo pipefail
 # now -- split into bootstrap/lib/wt/ when the devcontainer/compose commands
 # land (Phase 5).
 
-WT_VERSION='1.1.0'
+WT_VERSION='1.2.0'
 
 # Every message, usage string, and fix-it hint reads from this, so a renamed
 # executable or a symlink under another name does not tell the user to run a
@@ -78,7 +78,7 @@ wt_realpath() {
 
 # ------------------------------------------------------------------ help ----
 
-WT_COMMANDS=(init add go list path pull git sync container remove prune ignore doctor version)
+WT_COMMANDS=(init convert add go list path pull git sync container remove prune ignore doctor version)
 
 # Single source of truth per command: "<synopsis>\t<description>". The
 # command table, per-command --help, and every usage error read from here,
@@ -86,6 +86,7 @@ WT_COMMANDS=(init add go list path pull git sync container remove prune ignore d
 command_spec() {
     case "$1" in
         init)         printf '%s\t%s' 'init <url> <dir>'         'create an orchestration dir (bare clone + local/ state/ main/ wt/)' ;;
+        convert)      printf '%s\t%s' 'convert [--dry-run]'      'convert the enclosing clone into an orchestration dir, in place' ;;
         add)          printf '%s\t%s' 'add <name|pr:N> [base]'   'create a worktree (+ provision local files in orchestration mode)' ;;
         go)           printf '%s\t%s' 'go [name]'                'cd into a worktree (no name: the stable checkout)' ;;
         list)         printf '%s\t%s' 'list [--names|--json]'    'list worktrees for the current project' ;;
@@ -118,6 +119,27 @@ command_notes() {
 
 command_notes_raw() {
     case "$1" in
+        convert) cat <<'NOTE'
+  Rebuilds the enclosing normal clone as an orchestration dir at the same
+  path: .git becomes the bare repo.git, main/ is a fresh checkout of the
+  default branch, and every untracked and ignored file (.env, node_modules,
+  build caches) moves into it. The object database moves rather than being
+  re-cloned, so local branches, stashes, reflogs and extra remotes survive.
+
+  Refuses what it cannot convert losslessly: staged or unstaged changes
+  (commit or stash first -- untracked files are fine), a checked-out branch
+  other than the default, an in-progress merge or rebase, and submodules.
+  A failure before main/ exists rolls everything back to the clone.
+
+  Worktrees already in the sibling <repo>-worktrees/ dir are adopted:
+  repaired, moved under wt/, and given a port block.
+
+  The checkout itself necessarily moves from <root> to <root>/main, so
+  anything holding the old path (shells, editors, IDE workspaces, absolute
+  paths in env files) needs updating. --dry-run prints the plan and
+  changes nothing.
+NOTE
+        ;;
         add) cat <<'NOTE'
   <name> doubles as the branch name when it is a legal ref (e.g. user/CLK-943);
   otherwise the branch is the slugified name. [base] defaults to origin's
@@ -1056,6 +1078,219 @@ cmd_init() {
     printf '%s\n' "$root"
 }
 
+# Undo a conversion that failed before main/ was checked out. Everything up
+# to that point is renames on one filesystem, so the clone comes back
+# exactly. Never called after untracked files start moving into main/ --
+# from there the layout exists and fixing forward loses nothing.
+convert_rollback() {
+    local root="$1" stage="$2" entry
+    git --git-dir="$root/repo.git" worktree remove --force "$root/main" >/dev/null 2>&1 || true
+    # Only ever our own partial checkout: any pre-existing top-level 'main'
+    # entry is still in the staging dir at every point this can run.
+    rm -rf "$root/main"
+    git --git-dir="$root/repo.git" config core.bare false 2>/dev/null || true
+    if [[ -d "$root/repo.git" ]]; then
+        mv "$root/repo.git" "$root/.git" \
+            || { log "rollback failed: move $root/repo.git back to .git by hand"; return 1; }
+    fi
+    while IFS= read -r -d '' entry; do
+        mv "$entry" "$root/" \
+            || { log "rollback failed: restore files from $stage/tree by hand"; return 1; }
+    done < <(find "$stage/tree" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    rmdir "$stage/tree" "$stage" 2>/dev/null || true
+    log "rolled back; the clone is unchanged"
+}
+
+cmd_convert() {
+    local dry=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run) dry=1 ;;
+            *) die "unknown option: $arg (see '$WT_NAME convert --help')" ;;
+        esac
+    done
+    detect_mode
+    [[ "$WT_MODE" == "clone" ]] || die "already an orchestration dir: $WT_ROOT"
+    local root="$WT_ROOT"
+    [[ -d "$root/.git" ]] || die "no .git directory at $root -- nothing to convert"
+
+    # Submodule .git files carry gitdir pointers into .git/modules that the
+    # rename breaks and `git worktree repair` does not fix; refuse rather
+    # than half-convert.
+    if [[ -f "$root/.gitmodules" || -d "$root/.git/modules" ]]; then
+        die "repository uses submodules; convert does not support them"
+    fi
+
+    local marker
+    for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG rebase-merge rebase-apply; do
+        [[ ! -e "$root/.git/$marker" ]] || die "an operation is in progress ($marker); finish or abort it first"
+    done
+
+    local branch
+    branch="$(git -C "$root" symbolic-ref --short HEAD 2>/dev/null || true)"
+    [[ -n "$branch" ]] || die "detached HEAD; check out the default branch first"
+
+    # Clean tracked state only: untracked and ignored files are preserved by
+    # the move below, but staged or unstaged edits would be flattened by the
+    # fresh main/ checkout. Same guard remove and pull apply.
+    git -C "$root" diff --quiet || die "clone has unstaged changes; commit or stash them first"
+    git -C "$root" diff --cached --quiet || die "clone has staged changes; commit or stash them first"
+
+    local default_branch
+    default_branch="$(git -C "$root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    default_branch="${default_branch#origin/}"
+    if [[ -z "$default_branch" ]]; then
+        if git -C "$root" config remote.origin.url >/dev/null 2>&1; then
+            die "origin/HEAD is not set, so the default branch is unknown; fix: git remote set-head origin --auto"
+        fi
+        log "no origin remote; treating the checked-out branch '$branch' as the default"
+        default_branch="$branch"
+    fi
+    # main/ is contractually the stable default-branch checkout, and convert
+    # never guesses which worktree should own another branch.
+    [[ "$branch" == "$default_branch" ]] \
+        || die "'$branch' is checked out but main/ must hold '$default_branch'; check out '$default_branch' first"
+
+    local stage="$root/.wt-convert-stage"
+    [[ ! -e "$stage" ]] || die "staging dir left by an earlier convert: $stage (inspect it, restore anything needed, then remove it)"
+
+    # Captured before anything moves. --directory collapses wholly-untracked
+    # directories (node_modules and friends) to one entry, so the later move
+    # is one rename instead of one per file; no exclude flags, so the list
+    # includes ignored files -- .env and caches are what in-place conversion
+    # exists to preserve.
+    local untracked=() rel
+    while IFS= read -r -d '' rel; do
+        untracked+=("$rel")
+    done < <(git -C "$root" ls-files --others --directory -z)
+
+    # Sibling worktrees to adopt, captured while the clone's registry is
+    # still readable through the checkout. The first porcelain entry is the
+    # clone itself.
+    local siblings=() first=1 wt_path
+    while IFS= read -r wt_path; do
+        if [[ "$first" -eq 1 ]]; then first=0; continue; fi
+        siblings+=("$wt_path")
+    done < <(git -C "$root" worktree list --porcelain | sed -n 's/^worktree //p')
+
+    if (( dry )); then
+        log "would convert $root into an orchestration dir:"
+        log "  .git -> repo.git (bare; branches, stashes, reflogs, remotes move with it)"
+        log "  main/ <- fresh checkout of '$default_branch'"
+        log "  untracked/ignored entries to move into main/: ${#untracked[@]}"
+        for wt_path in ${siblings[@]+"${siblings[@]}"}; do
+            log "  adopt worktree: $wt_path -> $root/wt/$(basename "$wt_path")"
+        done
+        log "dry run; nothing changed"
+        return 0
+    fi
+
+    mkdir -p "$stage/tree"
+
+    # Everything at the top level except the git dir goes to staging: the
+    # working tree's contents all end up inside main/, which is also what
+    # makes scaffolding-name collisions (a tracked 'main/' or 'local/')
+    # impossible at the root.
+    local entries=() entry
+    while IFS= read -r -d '' entry; do
+        entries+=("$entry")
+    done < <(find "$root" -mindepth 1 -maxdepth 1 ! -name .git ! -name "$(basename "$stage")" -print0)
+    for entry in ${entries[@]+"${entries[@]}"}; do
+        mv "$entry" "$stage/tree/" \
+            || die "could not stage $entry; nothing irreversible happened -- move files back from $stage/tree and re-run"
+    done
+
+    mv "$root/.git" "$root/repo.git" \
+        || die "could not move .git aside; restore files from $stage/tree and re-run"
+    git --git-dir="$root/repo.git" config core.bare true
+    git --git-dir="$root/repo.git" config worktree.useRelativePaths true
+    # The old main working tree's index is meaningless in a bare repo, and a
+    # leftover one makes some tools think a working tree still lives here.
+    rm -f "$root/repo.git/index"
+
+    ensure_rel_flag
+    # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
+    if ! git --git-dir="$root/repo.git" worktree add $WT_REL_FLAG "$root/main" "$default_branch" >&2; then
+        convert_rollback "$root" "$stage"
+        die "could not check out '$default_branch' into main/; conversion rolled back"
+    fi
+
+    # Point of no rollback: the layout exists, failures from here fix
+    # forward. Move the preserved untracked/ignored files into the checkout.
+    local status=0
+    for rel in ${untracked[@]+"${untracked[@]}"}; do
+        rel="${rel%/}"
+        [[ -e "$stage/tree/$rel" || -L "$stage/tree/$rel" ]] || continue
+        if ! mkdir -p "$(dirname "$root/main/$rel")" \
+            || ! mv "$stage/tree/$rel" "$root/main/$rel"; then
+            log "warning: could not move $rel into main/ (left in $stage/tree)"
+            status=1
+        fi
+    done
+
+    # What remains staged should be exactly the tracked files the checkout
+    # recreated. Verify before discarding; anything else stays put, loudly.
+    local leftover tracked unexpected
+    leftover="$( (cd "$stage/tree" && find . \( -type f -o -type l \)) | sed 's|^\./||' | LC_ALL=C sort)"
+    tracked="$(git -C "$root/main" ls-files | LC_ALL=C sort)"
+    unexpected="$(LC_ALL=C comm -23 <(printf '%s\n' "$leftover") <(printf '%s\n' "$tracked") | sed '/^$/d')"
+    if [[ -z "$unexpected" && "$status" -eq 0 ]]; then
+        rm -rf "$stage"
+    else
+        log "warning: keeping $stage -- it still holds files the conversion could not account for"
+        [[ -z "$unexpected" ]] || log "$unexpected"
+        status=1
+    fi
+
+    mkdir -p "$root/local/shared" "$root/local/template" "$root/local/link" \
+             "$root/local/hooks" "$root/state" "$root/wt"
+    chmod 700 "$root/local"
+    write_ignore_file "$root" || log "warning: could not write $root/.ignore"
+
+    # Adopt the clone-mode worktrees: their pointers into .git/ went stale
+    # with the rename, so repair first, then move them under wt/ where list,
+    # remove, and the .ignore file expect them, then give each its runtime
+    # identity. A failed adoption leaves that worktree where it is.
+    WT_MODE="orchestration"
+    WT_ROOT="$root"
+    WT_GIT_DIR="$root/repo.git"
+    local old slug dest
+    for old in ${siblings[@]+"${siblings[@]}"}; do
+        if [[ ! -d "$old" ]]; then
+            log "warning: registered worktree missing, not adopted: $old"
+            status=1
+            continue
+        fi
+        slug="$(basename "$old")"
+        dest="$root/wt/$slug"
+        if ! git --git-dir="$root/repo.git" worktree repair "$old" >&2; then
+            log "warning: could not repair $old; adopt it by hand (git worktree repair, then git worktree move)"
+            status=1
+            continue
+        fi
+        if [[ -e "$dest" ]]; then
+            log "warning: $dest already exists; leaving $old where it is"
+            status=1
+            continue
+        fi
+        if ! git --git-dir="$root/repo.git" worktree move "$old" "$dest" >&2; then
+            log "warning: could not move $old under wt/; it stays where it is (repaired)"
+            status=1
+            continue
+        fi
+        write_worktree_env "$root" "$dest" "$slug" \
+            || { log "warning: could not assign a port block for $dest"; status=1; }
+        log "adopted worktree: $old -> $dest"
+        # The sibling <repo>-worktrees/ dir goes away with its last tenant.
+        rmdir "$(dirname "$old")" 2>/dev/null || true
+    done
+
+    log "converted $root (default branch: $default_branch)"
+    log "NOTE: the checkout moved from $root to $root/main -- update anything holding the old path (shells, editors, IDE workspaces, absolute paths in env files)"
+    printf '%s\n' "$root"
+    return "$status"
+}
+
 # pr:N and mr:N are synonyms on both forges. The number is unambiguous, so
 # rejecting `pr:` against a GitLab remote would add friction without adding
 # safety; the forge comes from the remote, never from the prefix typed.
@@ -1879,6 +2114,7 @@ fi
 
 case "$command_name" in
     init)         cmd_init "$@" ;;
+    convert)      cmd_convert "$@" ;;
     add)          cmd_add "$@" ;;
     go)           cmd_go "$@" ;;
     list)         cmd_list "$@" ;;

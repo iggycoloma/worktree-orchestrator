@@ -1370,6 +1370,92 @@ assert_not_contains "$(cat state/ports.tsv)" "stranded" \
 cd "$TMP" || exit 1
 
 # ============================================================
+# Test Suite: convert
+# ============================================================
+test_suite "convert"
+
+make_remote "$TMP/convremote.git"
+git clone -q "$TMP/convremote.git" "$TMP/convproj" 2>/dev/null
+cd "$TMP/convproj" || exit 1
+
+# Local state that must survive the conversion: an ignored env file, a
+# wholly-untracked directory, a local-only branch, a stash, and a
+# clone-mode worktree in the sibling dir.
+printf 'SECRET=1\n' > .env
+mkdir -p notes
+printf 'todo\n' > notes/todo.txt
+git branch local-only
+printf '# stash me\n' >> .gitignore
+git stash -q
+"$WT" add feature >/dev/null 2>&1
+
+output=$("$WT" convert --dry-run 2>&1)
+assert_equals 0 $? "convert --dry-run exits 0"
+assert_contains "$output" "dry run" "dry-run says nothing changed"
+assert_contains "$output" "feature" "dry-run names the worktree it would adopt"
+assert_dir_exists "$TMP/convproj/.git" "dry-run leaves .git in place"
+assert_command_fails "dry-run creates no repo.git" test -e "$TMP/convproj/repo.git"
+
+# Refusals: dirty tree, non-default branch, detached HEAD.
+printf '# dirty\n' >> .gitignore
+output=$("$WT" convert 2>&1)
+assert_equals 1 $? "convert refuses unstaged changes"
+assert_contains "$output" "unstaged changes" "dirty refusal names the reason"
+git checkout -q -- .gitignore
+
+git checkout -q -b sidework 2>/dev/null
+output=$("$WT" convert 2>&1)
+assert_equals 1 $? "convert refuses a non-default checked-out branch"
+assert_contains "$output" "check out 'main' first" "branch refusal names the fix"
+git checkout -q main
+git branch -q -D sidework
+
+git checkout -q --detach
+output=$("$WT" convert 2>&1)
+assert_equals 1 $? "convert refuses a detached HEAD"
+assert_contains "$output" "detached HEAD" "detached refusal names the reason"
+git checkout -q main
+
+root_out=$("$WT" convert 2>"$TMP/convert.log")
+status=$?
+assert_equals 0 "$status" "convert succeeds on a clean clone"
+assert_equals "$TMP/convproj" "$root_out" "convert prints the orchestration root"
+assert_equals "true" "$(git --git-dir="$TMP/convproj/repo.git" rev-parse --is-bare-repository 2>/dev/null)" \
+    "repo.git is the clone's git dir, now bare"
+assert_file_exists "$TMP/convproj/main/.gitignore" "tracked files are checked out in main/"
+assert_equals "SECRET=1" "$(cat "$TMP/convproj/main/.env" 2>/dev/null)" "ignored .env moved into main/"
+assert_file_exists "$TMP/convproj/main/notes/todo.txt" "untracked directory moved into main/"
+assert_command_succeeds "local-only branch survives (object db moved, not re-cloned)" \
+    git --git-dir="$TMP/convproj/repo.git" show-ref --verify --quiet refs/heads/local-only
+assert_command_succeeds "stash survives the conversion" \
+    git --git-dir="$TMP/convproj/repo.git" rev-parse --verify refs/stash
+assert_dir_exists "$TMP/convproj/wt/feature" "sibling worktree adopted under wt/"
+assert_command_succeeds "adopted worktree pointer is repaired" \
+    git -C "$TMP/convproj/wt/feature" rev-parse --git-dir
+assert_command_fails "emptied sibling worktree dir is removed" test -e "$TMP/convproj-worktrees"
+assert_command_fails "staging dir is cleaned up" test -e "$TMP/convproj/.wt-convert-stage"
+assert_file_exists "$TMP/convproj/.ignore" "convert writes the root .ignore"
+assert_file_exists "$TMP/convproj/wt/feature/.env.worktree" "adopted worktree gets runtime identity"
+assert_contains "$(cat "$TMP/convproj/state/ports.tsv" 2>/dev/null)" "feature" \
+    "adopted worktree holds a port reservation"
+assert_contains "$(cat "$TMP/convert.log")" "moved from" "convert warns that the checkout path changed"
+
+# The converted layout must be indistinguishable from an init-created one.
+output=$("$WT" doctor 2>&1)
+assert_equals 0 $? "doctor passes on a converted dir"
+assert_contains "$output" "mode: orchestration" "converted dir detects as orchestration mode"
+
+dest=$("$WT" add postconv 2>/dev/null)
+assert_equals "$TMP/convproj/wt/postconv" "$dest" "add provisions into the converted layout"
+"$WT" remove postconv >/dev/null 2>&1
+
+output=$("$WT" convert 2>&1)
+assert_equals 1 $? "convert refuses an orchestration dir"
+assert_contains "$output" "already an orchestration dir" "re-convert refusal names the reason"
+
+cd "$TMP" || exit 1
+
+# ============================================================
 # Summary
 # ============================================================
 print_test_summary
