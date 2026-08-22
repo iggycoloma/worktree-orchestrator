@@ -38,7 +38,9 @@ main() {
     if [[ -f "$script_dir/bin/wt" ]]; then
         src="$(cd "$script_dir" && pwd)"
     else
-        if [[ -d "$WT_ORCH_DIR/.git" ]]; then
+        # -e, not -d: a worktree-style checkout (wt's own orchestration
+        # main/ included) has a .git pointer file, not a directory.
+        if [[ -e "$WT_ORCH_DIR/.git" ]]; then
             if ! git -C "$WT_ORCH_DIR" pull --ff-only -q 2>/dev/null; then
                 warn "could not fast-forward $WT_ORCH_DIR; keeping the existing checkout"
             fi
