@@ -717,7 +717,7 @@ DEVCONTAINER_ENABLED=1
 COMPOSE_ENABLED=1
 ```
 
-Optionally, a project may track a safe configuration file such as `.dev/worktree.conf` containing no secrets:
+Optionally, a project may track a safe configuration file such as `.worktree.conf` containing no secrets:
 
 ```bash
 PROJECT_ID=example

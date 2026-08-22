@@ -676,14 +676,13 @@ port_after=$(sed -n 's/^APP_PORT=//p' "$dest/.env.worktree")
 assert_equals "$port_before" "$port_after" "sync preserves the allocated port"
 
 # Content change is picked up on sync.
-mkdir -p "$dest/.dev"
-printf 'PROJECT_ID=renamed\n' > "$dest/.dev/worktree.conf"
+printf 'PROJECT_ID=renamed\n' > "$dest/.worktree.conf"
 "$WT" sync hooked >/dev/null 2>&1
 assert_contains "$(cat "$dest/.env.worktree")" "COMPOSE_PROJECT_NAME=renamed-hooked" \
     "sync regenerates env when project config changes"
 
 # A checkout-controlled conf with a bad port range must warn, not abort.
-printf 'PORT_RANGE_START=abc\nPORT_RANGE_END=99xx\n' > "$dest/.dev/worktree.conf"
+printf 'PORT_RANGE_START=abc\nPORT_RANGE_END=99xx\n' > "$dest/.worktree.conf"
 output=$("$WT" sync hooked 2>&1)
 assert_equals 0 $? "garbage PORT_RANGE values do not abort sync"
 assert_contains "$output" "invalid PORT_RANGE_START" "bad range is reported"
@@ -900,8 +899,7 @@ make_remote "$TMP/r2.git"
 seed="$TMP/seed2"
 git clone -q "$TMP/r2.git" "$seed" 2>/dev/null
 printf '.env\n.env.*\nnode_modules/\nshared.txt\nlinked.txt\n' > "$seed/.gitignore"
-mkdir -p "$seed/.dev"
-printf 'CACHE_PATHS=node_modules\nPORT_BLOCK_SIZE=4\n' > "$seed/.dev/worktree.conf"
+printf 'CACHE_PATHS=node_modules\nPORT_BLOCK_SIZE=4\n' > "$seed/.worktree.conf"
 git -C "$seed" add -A && git -C "$seed" commit -q -m conf && git -C "$seed" push -q origin HEAD
 rm -rf "$seed"
 
@@ -954,7 +952,7 @@ assert_contains "$("$WT" doctor --json 2>/dev/null)" '"checks"' "doctor --json e
 # A cache path the project does not ignore is refused, exactly like local/.
 # The conf is tracked, so the change has to reach origin before a new worktree
 # checks it out.
-printf 'CACHE_PATHS=notignored\n' > main/.dev/worktree.conf
+printf 'CACHE_PATHS=notignored\n' > main/.worktree.conf
 git -C main add -A >/dev/null 2>&1
 git -C main commit -q -m "chore: point cache at a non-ignored path" >/dev/null 2>&1
 git -C main push -q origin HEAD >/dev/null 2>&1
@@ -966,7 +964,7 @@ assert_file_not_exists "$TMP/p2/wt/cache-bad" "a refused cache path rolls the wo
 
 # Restore the conf: it is tracked, so leaving it pointing at a non-ignored
 # path would make every later `add` in this fixture fail the same way.
-printf 'CACHE_PATHS=node_modules\nPORT_BLOCK_SIZE=4\n' > main/.dev/worktree.conf
+printf 'CACHE_PATHS=node_modules\nPORT_BLOCK_SIZE=4\n' > main/.worktree.conf
 rm -rf main/notignored
 git -C main add -A >/dev/null 2>&1
 git -C main commit -q -m "chore: restore cache conf" >/dev/null 2>&1

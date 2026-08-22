@@ -179,7 +179,7 @@ NOTE
   one pass. local/shared is overwritten in the worktree; local/template is
   never touched after the initial copy.
 
-  The build caches named by CACHE_PATHS in .dev/worktree.conf are then
+  The build caches named by CACHE_PATHS in .worktree.conf are then
   shared in, the same way add does it: only where the worktree has no copy
   of its own, so a cache it has since built is never replaced. This is what
   brings a worktree created before the conf existed up to date without
@@ -636,6 +636,13 @@ run_hook() {
 
 # ----------------------------------------------------- runtime identity ----
 
+# The tracked project config, relative to a worktree root. A plain root
+# dotfile rather than a directory: it is one flat file, and a repo root
+# already carries ./dev and .devcontainer/, which a .dev/ would sit between
+# and be mistaken for. Named for the domain, not for the executable, which
+# argv0 lets a user rename.
+WT_CONF_REL='.worktree.conf'
+
 # Minimal key=value reader for the tracked project config. Never sources
 # shell from an untrusted checkout; values are charset-restricted.
 read_conf() {
@@ -820,7 +827,7 @@ release_port() {
 # file that already carries an APP_PORT.
 write_worktree_env() {
     local root="$1" worktree="$2" slug="$3"
-    local conf="$worktree/.dev/worktree.conf" pid app_port slug_db envfile content
+    local conf="$worktree/$WT_CONF_REL" pid app_port slug_db envfile content
     envfile="$worktree/.env.worktree"
     pid="$(read_conf "$conf" PROJECT_ID "$(project_id)")"
     if ! git -C "$worktree" check-ignore -q -- .env.worktree; then
@@ -1472,7 +1479,7 @@ cmd_add() {
             rollback_add "$dest" "$branch" "$created_branch"
             die "provisioning failed; worktree rolled back"
         fi
-        if ! share_build_caches "$WT_ROOT" "$dest" "$dest/.dev/worktree.conf"; then
+        if ! share_build_caches "$WT_ROOT" "$dest" "$dest/$WT_CONF_REL"; then
             rollback_add "$dest" "$branch" "$created_branch"
             die "cache sharing failed; worktree rolled back"
         fi
@@ -1676,7 +1683,7 @@ cmd_sync() {
                 log "synced local/ into $wt_path"
                 # After provisioning, because the conf that names the cache
                 # paths can itself arrive from local/ in this same pass.
-                if ! share_build_caches "$WT_ROOT" "$wt_path" "$wt_path/.dev/worktree.conf"; then
+                if ! share_build_caches "$WT_ROOT" "$wt_path" "$wt_path/$WT_CONF_REL"; then
                     log "WARNING: cache sharing failed for $wt_path"
                     failures=$((failures + 1))
                     continue
@@ -1702,7 +1709,7 @@ cmd_sync() {
     run_hook pre-sync "$WT_ROOT" "$dest" || die "pre-sync hook failed; nothing copied"
     provision_local_files "$WT_ROOT" "$dest" || die "sync failed validation; nothing copied"
     log "synced local/ into $dest"
-    share_build_caches "$WT_ROOT" "$dest" "$dest/.dev/worktree.conf" \
+    share_build_caches "$WT_ROOT" "$dest" "$dest/$WT_CONF_REL" \
         || die "cache sharing failed for $dest"
     write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")" \
         || die "could not assign a port block for $dest"
