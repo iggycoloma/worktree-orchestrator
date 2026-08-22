@@ -447,6 +447,60 @@ assert_equals "SANDBOX_KEY=rotated" "$(cat "$dest/.env.shared")" \
     "sync --all refreshes task worktrees"
 
 # ============================================================
+# Test Suite: cwd-sensitive defaults
+# ============================================================
+test_suite "cwd-sensitive defaults"
+
+cd "$dest" || exit 1
+
+# go and path are the deliberate exceptions: from inside a worktree their
+# bare form still answers "where is the stable checkout".
+assert_equals "$TMP/proj/main" "$("$WT" path 2>/dev/null)" \
+    "path keeps meaning the stable checkout from inside a worktree"
+assert_equals "$TMP/proj/main" "$("$WT" go 2>/dev/null)" \
+    "go keeps meaning the stable checkout from inside a worktree"
+
+# sync acts on a tree, so it defaults the other way. Clearing the file from
+# both trees is what makes the assertion two-sided: the one you are in comes
+# back, the one you are not in does not.
+rm -f "$dest/.env.shared" "$TMP/proj/main/.env.shared"
+"$WT" sync >/dev/null 2>&1
+assert_equals 0 $? "bare sync from inside a worktree succeeds"
+assert_file_exists "$dest/.env.shared" "bare sync provisions the worktree you are standing in"
+assert_file_not_exists "$TMP/proj/main/.env.shared" \
+    "bare sync from inside a worktree leaves main alone"
+
+# --config resolves against the target and fails before the docker check, so
+# the path in the error names whichever worktree was chosen.
+output=$("$WT" container exec --config nope.json -- true 2>&1)
+assert_not_contains "$output" "usage: wt container" \
+    "container exec no longer needs a name: -- already separates the arguments"
+assert_contains "$output" "$dest/nope.json" \
+    "container exec with no name resolves the worktree you are standing in"
+
+mkdir -p "$dest/nested/deeper"
+cd "$dest/nested/deeper" || exit 1
+output=$("$WT" container exec --config nope.json -- true 2>&1)
+assert_contains "$output" "$dest/nope.json" "a subdirectory resolves to the same worktree"
+rm -rf "$dest/nested"
+
+# Outside every worktree there is nothing to infer, so the stable checkout
+# stands in -- the orchestration root, local/ and state/ all count as outside.
+cd "$TMP/proj" || exit 1
+output=$("$WT" container exec --config nope.json -- true 2>&1)
+assert_contains "$output" "$TMP/proj/main/nope.json" \
+    "outside every worktree, container exec falls back to the stable checkout"
+output=$("$WT" container up --config nope.json 2>&1)
+assert_contains "$output" "$TMP/proj/main/nope.json" "container up shares the same default"
+cd "$TMP/proj/local" || exit 1
+output=$("$WT" container exec --config nope.json -- true 2>&1)
+assert_contains "$output" "$TMP/proj/main/nope.json" "local/ counts as outside every worktree"
+
+cd "$TMP/proj" || exit 1
+"$WT" sync main >/dev/null 2>&1
+assert_file_exists "$TMP/proj/main/.env.shared" "a named sync restores the stable checkout"
+
+# ============================================================
 # Test Suite: runtime identity and port registry
 # ============================================================
 test_suite "runtime identity"
@@ -724,15 +778,26 @@ assert_contains "$output" "verbatim" "wt git help documents the pass-through"
 output=$("$WT" git 2>&1)
 assert_not_equals 0 $? "wt git without a name is a usage error"
 
-# wt pull with no name fast-forwards main/ from anywhere in the layout.
+# wt pull with no name targets the worktree it is run from. pull-feature was
+# never pushed, so there is nothing to fast-forward it to -- and main/ has to
+# be left exactly where it was, which is the whole point of the change.
 advance_remote "$TMP/remote-pull.git" advance-1
 remote_tip=$(git --git-dir="$TMP/remote-pull.git" rev-parse HEAD)
 feature=$("$WT" add pull-feature 2>/dev/null)
+main_before=$(git -C "$TMP/pullproj/main" rev-parse HEAD)
 cd "$feature" || exit 1
-"$WT" pull >/dev/null 2>&1
-assert_equals 0 $? "wt pull succeeds from inside a feature worktree"
+output=$("$WT" pull 2>&1)
+assert_not_equals 0 $? "bare pull targets the worktree it is run from, not main"
+assert_contains "$output" "no origin/pull-feature" \
+    "pull names the branch it found no counterpart for"
+assert_equals "$main_before" "$(git -C "$TMP/pullproj/main" rev-parse HEAD)" \
+    "bare pull from inside a worktree leaves main/ untouched"
+
+# A named target still wins regardless of where it is run from.
+"$WT" pull main >/dev/null 2>&1
+assert_equals 0 $? "wt pull main succeeds from inside another worktree"
 assert_equals "$remote_tip" "$(git -C "$TMP/pullproj/main" rev-parse HEAD)" \
-    "wt pull default target is main/, fast-forwarded to the remote tip"
+    "a named target is honoured regardless of cwd"
 cd "$TMP/pullproj" || exit 1
 
 # add pre-fetch: the feature branched AFTER the remote advanced must start
@@ -756,6 +821,33 @@ assert_contains "$output" "fast-forward" "divergence error names the ff-only pol
 git -C "$TMP/pullproj/main" reset -q --hard origin/main
 "$WT" pull >/dev/null 2>&1
 assert_equals 0 $? "wt pull recovers once main/ is back on the remote line"
+
+# --all fetches once and sweeps every registered worktree. A branch with no
+# origin counterpart is the normal state of a task worktree, so it is counted
+# and skipped -- failing on it would make the sweep useless on any real
+# layout, where most trees have never been pushed.
+advance_remote "$TMP/remote-pull.git" advance-3
+output=$("$WT" pull --all 2>&1)
+assert_equals 0 $? "pull --all succeeds when a worktree has no origin branch"
+assert_contains "$output" "no origin/pull-feature" "pull --all names the skipped branch"
+assert_contains "$output" "1 with no origin branch" "pull --all counts what it skipped"
+assert_equals "$(git --git-dir="$TMP/remote-pull.git" rev-parse HEAD)" \
+    "$(git -C "$TMP/pullproj/main" rev-parse HEAD)" "pull --all fast-forwards main"
+
+# A dirty tree is a real refusal and must fail the command, but only after
+# the rest of the sweep has run.
+printf 'dirty\n' >> "$TMP/pullproj/main/.gitignore"
+output=$("$WT" pull --all 2>&1)
+assert_not_equals 0 $? "pull --all fails when a worktree refuses"
+assert_contains "$output" "unstaged changes" "pull --all names the refusing tree"
+assert_contains "$output" "could not be fast-forwarded" "pull --all summarises the failure"
+git -C "$TMP/pullproj/main" checkout -q -- .gitignore
+
+output=$("$WT" pull --all pull-feature 2>&1)
+assert_not_equals 0 $? "pull --all with a name is a usage error"
+output=$("$WT" pull --bogus 2>&1)
+assert_not_equals 0 $? "pull rejects an unknown option"
+assert_contains "$output" "unknown option" "pull names the offending flag"
 
 # A branch that was never pushed cannot pull.
 output=$("$WT" pull pull-feature 2>&1)

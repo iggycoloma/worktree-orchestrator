@@ -91,9 +91,9 @@ command_spec() {
         go)           printf '%s\t%s' 'go [name]'                'cd into a worktree (no name: the stable checkout)' ;;
         list)         printf '%s\t%s' 'list [--names|--json]'    'list worktrees for the current project' ;;
         path)         printf '%s\t%s' 'path [name]'              "print the worktree's path (default: main)" ;;
-        pull)         printf '%s\t%s' 'pull [name]'              "fetch origin and fast-forward a worktree to origin/<branch> (default: main)" ;;
+        pull)         printf '%s\t%s' 'pull [name|--all]'        "fetch origin and fast-forward a worktree to origin/<branch> (default: the one you are in)" ;;
         git)          printf '%s\t%s' 'git <name> <git-args...>' 'run git in the named worktree (verbatim pass-through)' ;;
-        sync)         printf '%s\t%s' 'sync [name|--all] [--diff]' "refresh local/ files and shared caches into a worktree (default: main); --diff previews drift" ;;
+        sync)         printf '%s\t%s' 'sync [name|--all] [--diff]' "refresh local/ files and shared caches into a worktree (default: the one you are in); --diff previews drift" ;;
         container)    printf '%s\t%s' 'container up|exec ...'    "manage the worktree's dev container (host only)" ;;
         remove)       printf '%s\t%s' 'remove <name> [--branch]' 'remove a worktree + its containers (refuses dirty)' ;;
         prune)        printf '%s\t%s' 'prune'                    'clean up stale worktree administrative entries' ;;
@@ -157,7 +157,11 @@ NOTE
         go) cat <<'NOTE'
   <name> may be a worktree name or any unambiguous prefix of one, so a
   truncated slug never has to be typed in full. With no name: main/ in
-  orchestration mode, the repository root in clone mode.
+  orchestration mode, the repository root in clone mode -- deliberately not
+  the worktree you are standing in, because answering "where is the stable
+  checkout" from inside a worktree is the whole point of the bare form.
+  The commands that act on a tree (pull, sync, container) default the other
+  way.
 
   Only the shell function changes directory; the binary prints the path,
   which is what makes `cd "$(@WT@ go x)"` work from scripts.
@@ -170,14 +174,20 @@ NOTE
         ;;
         path) cat <<'NOTE'
   <name> may be a worktree name or any unambiguous prefix of one. With no
-  name: main/ in orchestration mode, the repository root in clone mode.
+  name: main/ in orchestration mode, the repository root in clone mode --
+  the same stable-checkout answer go gives, so `cd "$(@WT@ path)"` means one
+  thing wherever it runs.
 NOTE
         ;;
         sync) cat <<'NOTE'
-  <name> may be a worktree name, an unambiguous prefix, or an absolute path;
-  it defaults to main. --all syncs main plus every registered worktree in
-  one pass. local/shared is overwritten in the worktree; local/template is
-  never touched after the initial copy.
+  <name> may be a worktree name, an unambiguous prefix, or an absolute path.
+  With no name it targets the worktree you are standing in, and the stable
+  checkout when you are outside every worktree. --all syncs main plus every
+  registered worktree in one pass, and is never implied -- a bare sync
+  writes to exactly one tree.
+
+  local/shared is overwritten in the worktree; local/template is never
+  touched after the initial copy.
 
   The build caches named by CACHE_PATHS in .worktree.conf are then
   shared in, the same way add does it: only where the worktree has no copy
@@ -213,9 +223,13 @@ NOTE
 NOTE
         ;;
         container) cat <<'NOTE'
-  @WT@ container up [name] [--config <path>]      start the dev container (default: main)
-  @WT@ container exec <name> [--config <path>] -- <cmd...>
+  @WT@ container up [name] [--config <path>]      start the dev container
+  @WT@ container exec [name] [--config <path>] -- <cmd...>
                                           run a command in the container
+
+  Both default to the worktree you are standing in, and to the stable
+  checkout outside every worktree. exec can leave the name out because the
+  mandatory -- already separates @WT@'s arguments from the container's.
 
   --config selects a devcontainer.json when the project ships more than one
   (e.g. .devcontainer/<variant>/devcontainer.json); a relative path resolves
@@ -229,10 +243,26 @@ NOTE
 NOTE
         ;;
         pull) cat <<'NOTE'
-  Fetches origin (--prune), then fast-forwards the worktree's branch to
-  origin/<branch>. Refuses staged or unstaged changes, and never merges or
-  rebases: a diverged tree is an error to resolve explicitly, not an
-  implicit merge. Keeps the stable main/ checkout pristine by construction.
+  <name> may be a worktree name, an unambiguous prefix, or an absolute path.
+  With no name it targets the worktree you are standing in, and the stable
+  checkout when you are outside every worktree -- at the orchestration root,
+  or in local/ or state/.
+
+  Fetches origin (--prune), then fast-forwards the branch to its own
+  origin/<branch> -- not to whatever upstream the branch was configured with,
+  which for a fresh worktree is the default branch and would be the wrong
+  thing to merge in. Refuses staged or unstaged changes, and never merges or
+  rebases: a diverged tree is an error to resolve explicitly.
+
+  A branch with no origin/<branch> yet has nothing to pull. Named, that is an
+  error -- it is what a task worktree looks like until it is pushed, and
+  '@WT@ pull main' is probably what was meant. Under --all it is counted and
+  skipped instead, because that is the normal state of much of a working
+  layout and failing on it would make the sweep useless.
+
+  --all fetches once for the whole sweep and reports per worktree. A dirty
+  tree or a divergence is reported where it happens and fails the command
+  once the sweep finishes, so one bad tree never hides the rest.
 NOTE
         ;;
         git) cat <<'NOTE'
@@ -958,11 +988,48 @@ default_worktree() {
     fi
 }
 
-# Shared "[name] defaults to main" resolution for the commands whose name
-# is optional. Commands where the name is structurally required (add, git,
-# container exec, remove) never call this.
+# Shared "[name] defaults to main" resolution, for go and path only: with no
+# name they answer "where is the stable checkout", which is how a caller gets
+# back out of a worktree rather than acting on one.
 resolve_or_default() {
     if [[ -n "${1:-}" ]]; then resolve_worktree "$1"; else default_worktree; fi
+}
+
+# The worktree the caller is standing in, or nothing when the cwd is outside
+# every one of them -- the orchestration root itself, local/, state/.
+#
+# Physical paths on both sides: git reports worktree paths with symlinks
+# resolved, so a tree reached through a symlinked parent would otherwise
+# never match and would silently fall back to the stable checkout, which is
+# the exact surprise this resolution exists to remove.
+current_worktree() {
+    local here candidate resolved
+    here="$(pwd -P 2>/dev/null)" || return 0
+    while IFS= read -r candidate; do
+        resolved="$(cd -P "$candidate" 2>/dev/null && pwd)" || continue
+        [[ "$here" == "$resolved" || "$here" == "$resolved"/* ]] || continue
+        printf '%s\n' "$candidate"
+        return 0
+    done < <(registered_worktrees)
+    return 0
+}
+
+# Shared "[name] defaults to the worktree you are standing in" resolution,
+# for the commands that act on a tree rather than point at one. Outside every
+# worktree there is nothing to infer, so the stable checkout stands in.
+#
+# add, remove and git never call this, each for its own reason: add's name is
+# the tree being created, remove is destructive enough that naming it is the
+# safety property, and `git <name> <args...>` is verbatim pass-through with no
+# separator, so `wt git status` cannot be told from a worktree called status.
+resolve_or_current() {
+    local here
+    if [[ -n "${1:-}" ]]; then
+        resolve_worktree "$1"
+        return 0
+    fi
+    here="$(current_worktree)"
+    if [[ -n "$here" ]]; then printf '%s\n' "$here"; else default_worktree; fi
 }
 
 cmd_container() {
@@ -988,7 +1055,7 @@ cmd_container_up() {
     done
     detect_mode
     local dest slug repo
-    dest="$(resolve_or_default "$name")"
+    dest="$(resolve_or_current "$name")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
     config="$(resolve_devcontainer_config "$dest" "$config")"
     require_host_docker
@@ -1018,13 +1085,15 @@ cmd_container_exec() {
         esac
         shift
     done
-    require_name container "$name"
+    # No require_name: the mandatory -- already separates wt's arguments from
+    # the container command, so an omitted name is unambiguous here in a way
+    # it is not for `wt git`.
     [[ "${1:-}" == "--" ]] || die "usage: $(command_synopsis container)"
     shift
     [[ $# -gt 0 ]] || die "usage: $(command_synopsis container)"
     detect_mode
     local dest slug
-    dest="$(resolve_worktree "$name")"
+    dest="$(resolve_or_current "$name")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
     config="$(resolve_devcontainer_config "$dest" "$config")"
     require_host_docker
@@ -1586,33 +1655,78 @@ cmd_path() {
     printf '%s\n' "$dest"
 }
 
-cmd_pull() {
-    check_args pull 0 1 "$@"
-    detect_mode
-    local dest
-    dest="$(resolve_or_default "${1:-}")"
-    [[ -d "$dest" ]] || die "no such worktree: $dest"
-
-    local branch
+# One worktree's fast-forward, with the fetch left to the caller so a sweep
+# pays for it once. Reasons are logged here rather than raised, so both
+# callers report the same thing and only the handling differs.
+#
+# 0 fast-forwarded, 1 a state the command must refuse, 2 nothing to pull
+# because the branch has no origin counterpart yet. That last one is a
+# distinct code because it is the normal state of a fresh task worktree: an
+# error when a caller named the tree, unremarkable during --all.
+pull_one() {
+    local dest="$1" branch
     branch="$(git -C "$dest" symbolic-ref --short HEAD 2>/dev/null || true)"
-    [[ -n "$branch" ]] || die "cannot pull: detached HEAD in $dest"
+    [[ -n "$branch" ]] || { log "cannot pull: detached HEAD in $dest"; return 1; }
 
-    # Fast-forward only, and never over local edits: main/ must stay
-    # pristine, and a diverged branch needs an explicit rebase decision,
-    # not an implicit merge. Untracked files are left to git, which
-    # aborts by itself on a collision.
-    git -C "$dest" diff --quiet || die "worktree has unstaged changes: $dest"
-    git -C "$dest" diff --cached --quiet || die "worktree has staged changes: $dest"
+    # Fast-forward only, and never over local edits: the stable checkout must
+    # stay pristine, and a diverged branch needs an explicit rebase decision,
+    # not an implicit merge. Untracked files are left to git, which aborts by
+    # itself on a collision.
+    git -C "$dest" diff --quiet || { log "worktree has unstaged changes: $dest"; return 1; }
+    git -C "$dest" diff --cached --quiet || { log "worktree has staged changes: $dest"; return 1; }
 
-    git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin || die "fetch failed"
-    git --git-dir="$WT_GIT_DIR" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null \
-        || die "no origin/$branch to pull (branch never pushed?)"
+    if ! git --git-dir="$WT_GIT_DIR" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+        log "no origin/$branch to pull (branch never pushed?)"
+        return 2
+    fi
     git -C "$dest" merge --ff-only "origin/$branch" >&2 \
-        || die "cannot fast-forward: $dest has commits not on origin/$branch"
+        || { log "cannot fast-forward: $dest has commits not on origin/$branch"; return 1; }
     log "pulled $dest ($branch -> origin/$branch)"
+}
+
+cmd_pull() {
+    local name="" all=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --all) all=1 ;;
+            -*) die "unknown option: $arg (see '$WT_NAME pull --help')" ;;
+            *)  [[ -z "$name" ]] || die "usage: $(command_synopsis pull)"; name="$arg" ;;
+        esac
+    done
+    [[ "$all" -eq 0 || -z "$name" ]] || die "usage: $(command_synopsis pull)"
+    detect_mode
+
+    local hook_status=0 rc=0
+    if [[ "$all" -eq 1 ]]; then
+        # One fetch for the whole sweep: every per-tree merge reads only
+        # refs/remotes/origin/*, so N fetches would buy nothing but latency.
+        git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin || die "fetch failed"
+        local wt_path failures=0 pulled=0 skipped=0
+        while IFS= read -r wt_path; do
+            [[ -d "$wt_path" ]] || continue
+            rc=0
+            pull_one "$wt_path" || rc=$?
+            case "$rc" in
+                0)  pulled=$((pulled + 1))
+                    if [[ "$WT_MODE" == "orchestration" ]]; then
+                        run_hook post-pull "$WT_ROOT" "$wt_path" || hook_status=1
+                    fi ;;
+                2)  skipped=$((skipped + 1)) ;;
+                *)  failures=$((failures + 1)) ;;
+            esac
+        done < <(registered_worktrees)
+        log "pull --all: $pulled fast-forwarded, $skipped with no origin branch"
+        [[ "$failures" -eq 0 ]] || die "pull --all: $failures worktree(s) could not be fast-forwarded"
+        return "$hook_status"
+    fi
+
+    local dest
+    dest="$(resolve_or_current "$name")"
+    [[ -d "$dest" ]] || die "no such worktree: $dest"
+    git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin || die "fetch failed"
+    pull_one "$dest" || exit 1
     # New commits can invalidate installed dependencies and generated files,
     # so this is the natural place to reinstall or regenerate them.
-    local hook_status=0
     if [[ "$WT_MODE" == "orchestration" ]]; then
         run_hook post-pull "$WT_ROOT" "$dest" || hook_status=1
     fi
@@ -1674,7 +1788,7 @@ cmd_sync() {
             done < <(registered_worktrees)
         else
             local dest
-            dest="$(resolve_or_default "$name")"
+            dest="$(resolve_or_current "$name")"
             [[ -d "$dest" ]] || die "no such worktree: $dest"
             diff_local_tree "$dest" || drift=1
         fi
@@ -1726,7 +1840,7 @@ cmd_sync() {
     fi
 
     local dest
-    dest="$(resolve_or_default "$name")"
+    dest="$(resolve_or_current "$name")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
     run_hook pre-sync "$WT_ROOT" "$dest" || die "pre-sync hook failed; nothing copied"
     provision_local_files "$WT_ROOT" "$dest" || die "sync failed validation; nothing copied"
