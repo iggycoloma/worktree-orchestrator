@@ -925,6 +925,27 @@ assert_contains "$(cat "$d/.env.worktree")" "WORKTREE_PORT_END" "the env carries
 # handing out a single port.
 assert_contains "$(cat state/ports.tsv)" "3100	3103" "the block size from the tracked conf is honoured"
 
+# sync applies the same cache sharing as add, so a worktree that predates the
+# conf -- or one whose cache was deleted -- is brought up to date in place
+# rather than being recreated.
+rm -rf "$d/node_modules"
+"$WT" sync feat >/dev/null 2>&1
+assert_equals 0 $? "wt sync feat succeeds"
+assert_file_exists "$d/node_modules/pkg.txt" "sync fills a cache path the worktree is missing"
+
+# Fill-only: a cache the worktree has since built for itself is left alone,
+# which is what makes running sync repeatedly safe.
+printf 'built-here\n' > "$d/node_modules/pkg.txt"
+"$WT" sync feat >/dev/null 2>&1
+assert_equals "built-here" "$(cat "$d/node_modules/pkg.txt")" \
+    "sync never replaces a cache the worktree already has"
+
+rm -rf "$d/node_modules"
+"$WT" sync --all >/dev/null 2>&1
+assert_equals 0 $? "wt sync --all succeeds"
+assert_file_exists "$d/node_modules/pkg.txt" "sync --all shares caches into every worktree"
+assert_not_symlink "$d/node_modules" "sync honours CACHE_MODE=copy just as add does"
+
 assert_contains "$("$WT" list --json 2>/dev/null)" '"worktrees"' "list --json emits a worktrees array"
 assert_not_contains "$("$WT" list --names 2>/dev/null)" "repo.git" \
     "the bare repo is never reported as a worktree"

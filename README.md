@@ -57,7 +57,7 @@ list [--names|--json]       list worktrees for the current project
 path [name]                 print the worktree's path (default: main)
 pull [name]                 fetch origin and fast-forward a worktree to origin/<branch> (default: main)
 git <name> <git-args...>    run git in the named worktree (verbatim pass-through)
-sync [name|--all] [--diff]  refresh local/shared into a worktree (default: main); --diff previews drift
+sync [name|--all] [--diff]  refresh local/ files and shared caches into a worktree (default: main); --diff previews drift
 container up|exec ...       manage the worktree's dev container (host only)
 remove <name> [--branch]    remove a worktree + its containers (refuses dirty)
 prune                       clean up stale worktree administrative entries
