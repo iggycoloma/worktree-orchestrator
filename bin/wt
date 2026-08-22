@@ -98,7 +98,7 @@ command_spec() {
         remove)       printf '%s\t%s' 'remove <name> [--branch]' 'remove a worktree + its containers (refuses dirty)' ;;
         prune)        printf '%s\t%s' 'prune'                    'clean up stale worktree administrative entries' ;;
         ignore)       printf '%s\t%s' 'ignore [--print] [path]'  'write a workspace .ignore so searches skip worktrees (default: .)' ;;
-        doctor)       printf '%s\t%s' 'doctor [--json]'          'check layout, git version, pointers, and tooling' ;;
+        doctor)       printf '%s\t%s' 'doctor [--json]'          'check layout, git version, pointers, tooling, and provisioning config' ;;
         version)      printf '%s\t%s' 'version [--json]'         'print the version and where this executable came from' ;;
         *) return 1 ;;
     esac
@@ -188,6 +188,28 @@ NOTE
   --diff previews instead of copying: one line per missing or differing
   file under local/shared, exit 1 on drift, nothing written. Caches are not
   part of the preview. Combines with --all.
+NOTE
+        ;;
+        doctor) cat <<'NOTE'
+  Two groups of checks. The first is layout: git version, worktree
+  pointers, the root .ignore, the port registry and its lock, and the
+  devcontainer CLI.
+
+  The second is provisioning -- whether add and sync will do what the
+  project declared. It reads local/hooks and each worktree's
+  .worktree.conf and reports what would otherwise happen in silence: a
+  hook that is not executable or is named for no real stage, a conf key
+  whose value never parses (a space in a CACHE_PATHS list, an indented key,
+  a space around '='), an unrecognised CACHE_MODE, and the gitignore rules
+  provisioning depends on. Every worktree is checked separately, because
+  .gitignore and the conf are tracked and can differ per branch.
+
+  .env.worktree is the one worth naming: when a project does not ignore it,
+  add still succeeds and prints a path, and the worktree quietly has no
+  runtime identity and no port block. Nothing but doctor reports that.
+
+  Notes never fail the run; warnings do, and each names its fix. --json
+  emits the same findings as objects for scripting.
 NOTE
         ;;
         container) cat <<'NOTE'
@@ -1947,6 +1969,13 @@ cmd_version() {
     return 0
 }
 
+# Every key read_conf is ever asked for, and every stage run_hook is ever
+# called with. Both lists exist so doctor can ask the question those two
+# functions cannot: not "what does this setting do" but "did the tool read
+# the thing the project wrote". Keep them in step with their call sites.
+WT_CONF_KEYS='CACHE_PATHS CACHE_MODE PORT_RANGE_START PORT_RANGE_END PORT_BLOCK_SIZE PROJECT_ID'
+WT_HOOK_STAGES='pre-add post-add post-pull pre-sync post-sync pre-remove post-remove'
+
 # Each check reports through one of these so --json can carry the same
 # findings the text output does. The human strings are assembled here rather
 # than at the call sites, which is what keeps the two renderings from drifting.
@@ -1960,6 +1989,146 @@ doctor_row() {
 d_ok()   { (( DOCTOR_JSON )) || log "$*";            doctor_row ok   "$*"; }
 d_warn() { (( DOCTOR_JSON )) || log "WARNING: $*";   doctor_row warn "$*"; }
 d_note() { (( DOCTOR_JSON )) || log "note: $*";      doctor_row note "$*"; }
+
+# The provisioning checks run per worktree and each can find several
+# problems, so they report through a counter instead of a return status.
+DOCTOR_FAILURES=0
+d_fail() { d_warn "$*"; DOCTOR_FAILURES=$((DOCTOR_FAILURES + 1)); }
+
+# run_hook executes a hook only when it is executable and named for a stage
+# it is actually called with. Both misses are silent by construction: the
+# file is sitting there, nothing runs it, and no command has any reason to
+# mention it. A project finds out by noticing its setup never happened.
+doctor_check_hooks() {
+    local dir="$WT_ROOT/local/hooks" f base stage
+    [[ -d "$dir" ]] || return 0
+    for f in "$dir"/*; do
+        # No nullglob: an empty dir leaves the pattern itself as the word.
+        [[ -f "$f" ]] || continue
+        base="${f##*/}"
+        stage="${base%.async}"
+        case " $WT_HOOK_STAGES " in
+            *" $stage "*) ;;
+            *)  d_fail "local/hooks/$base matches no hook stage, so nothing runs it (stages: $WT_HOOK_STAGES)"
+                continue ;;
+        esac
+        if [[ ! -x "$f" ]]; then
+            d_fail "local/hooks/$base is not executable, so it is skipped without a word; fix: chmod +x '$f'"
+        elif [[ "$base" == *.async && "$stage" == pre-* ]]; then
+            d_fail "local/hooks/$base never runs: a pre-* gate that does not block is not a gate"
+        fi
+    done
+}
+
+# read_conf substitutes its default whenever a line does not match ^KEY= or
+# the value carries a character outside its allowed set, and says nothing
+# when it does. "The project set this key" and "the value was read" are
+# therefore different questions, and only the second has consequences: one
+# stray space in CACHE_PATHS turns cache sharing off for good, in silence.
+doctor_check_conf() {
+    local conf="$1" label="$2" key raw parsed count mode
+    [[ -f "$conf" ]] || return 0
+    for key in $WT_CONF_KEYS; do
+        raw="$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=//p" "$conf" | head -1)"
+        # A deliberately emptied key is a choice, not a typo.
+        [[ -n "${raw//[[:space:]]/}" ]] || continue
+        parsed="$(read_conf "$conf" "$key" "")"
+        if [[ -z "$parsed" ]]; then
+            d_fail "$label: $key is set but no value is read from it, so the built-in default applies -- the line must be '$key=value', unindented, no space around '=', value limited to A-Za-z0-9._/,-"
+        fi
+        count="$(grep -cE "^[[:space:]]*${key}[[:space:]]*=" "$conf" 2>/dev/null || true)"
+        [[ "${count:-0}" -le 1 ]] || d_note "$label: $key is set $count times; the first wins"
+    done
+    mode="$(read_conf "$conf" CACHE_MODE copy)"
+    case "$mode" in
+        copy|link) ;;
+        *) d_fail "$label: CACHE_MODE=$mode is not a mode (copy|link); caches are being copied" ;;
+    esac
+}
+
+# One check-ignore per worktree rather than one per path: the file counts
+# here are small but not one, and agents run doctor in loops.
+doctor_unignored() {
+    local worktree="$1" probes="$2" ignored line
+    [[ -n "$probes" ]] || return 0
+    ignored="$(printf '%s\n' "$probes" | git -C "$worktree" check-ignore --stdin 2>/dev/null || true)"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        printf '%s\n' "$ignored" | grep -qxF -- "$line" || printf '%s\n' "$line"
+    done < <(printf '%s\n' "$probes")
+}
+
+# The relative destinations every local/ tree provisions into. Identical for
+# every worktree, so it is built once and asked of each.
+doctor_local_probes() {
+    local dir src rel out=""
+    for dir in shared template link; do
+        [[ -d "$WT_ROOT/local/$dir" ]] || continue
+        while IFS= read -r -d '' src; do
+            rel="${src#"$WT_ROOT/local/$dir"/}"
+            out="$out$rel"$'\n'
+        done < <(find "$WT_ROOT/local/$dir" -type f -print0)
+    done
+    printf '%s' "$out" | sort -u
+}
+
+# The same probe shape share_build_caches uses: a directory pattern only
+# matches when the probe carries the trailing slash itself.
+#
+# Entries with no source in the stable checkout are left out, because that is
+# where share_build_caches gives up too -- probing them anyway reports a path
+# as unignored that nothing would ever have tried to share. They are covered
+# by the absent-source note instead.
+doctor_cache_probes() {
+    local conf="$1" stable="$2" paths entry out=""
+    paths="$(read_conf "$conf" CACHE_PATHS "")"
+    [[ -n "$paths" ]] || return 0
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        [[ -e "$stable/$entry" ]] || continue
+        [[ ! -d "$stable/$entry" ]] || entry="$entry/"
+        out="$out$entry"$'\n'
+    done < <(printf '%s\n' "$paths" | tr ',' '\n')
+    printf '%s' "$out"
+}
+
+# The gitignore coverage every provisioning path depends on, checked before
+# a command needs it. local/ and CACHE_PATHS fail loudly at add and sync
+# time; .env.worktree does not fail at all -- write_worktree_env warns once
+# and returns success, leaving a worktree with no runtime identity and no
+# port block while add still prints a path and exits 0.
+#
+# Per worktree, not once against the stable checkout: .gitignore and
+# .worktree.conf are both tracked, so a task branch can be broken while
+# the default branch is clean.
+doctor_check_coverage() {
+    local worktree="$1" label="$2" stable="$3" local_probes="$4"
+    local conf="$worktree/$WT_CONF_REL" rel entry paths
+
+    if ! git -C "$worktree" check-ignore -q -- .env.worktree 2>/dev/null; then
+        d_fail "$label: .env.worktree is not gitignored, so this worktree silently gets no runtime identity and no port block; add it to .gitignore"
+    fi
+
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        d_fail "$label: local/ provisions '$rel', which this branch does not gitignore; add and sync both refuse it"
+    done < <(doctor_unignored "$worktree" "$local_probes")
+
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        d_fail "$label: CACHE_PATHS names '$rel', which this branch does not gitignore; add and sync both refuse it"
+    done < <(doctor_unignored "$worktree" "$(doctor_cache_probes "$conf" "$stable")")
+
+    # A note, never a failure: on a checkout where nobody has installed
+    # dependencies yet, every cache path is legitimately absent.
+    paths="$(read_conf "$conf" CACHE_PATHS "")"
+    [[ -n "$paths" ]] || return 0
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        [[ ! -e "$stable/$entry" ]] || continue
+        d_note "$label: CACHE_PATHS entry '$entry' is absent from $stable, so nothing is shared for it"
+    done < <(printf '%s\n' "$paths" | tr ',' '\n')
+}
 
 cmd_doctor() {
     local arg
@@ -2079,6 +2248,26 @@ cmd_doctor() {
             done < "$registry"
             [[ "$orphans" -gt 0 ]] || d_ok "port registry: no orphaned reservations"
         fi
+
+        # Everything above answers "is the layout intact". This group answers
+        # "will provisioning actually do what the project declared" -- the
+        # settings and ignore rules add and sync depend on, checked while
+        # they can still be fixed cheaply rather than at the moment a
+        # worktree is being created.
+        doctor_check_hooks
+        local stable local_probes label
+        stable="$(default_worktree)"
+        local_probes="$(doctor_local_probes)"
+        while IFS= read -r wt_path; do
+            [[ -d "$wt_path" ]] || continue
+            label="${wt_path##*/}"
+            doctor_check_conf "$wt_path/$WT_CONF_REL" "$label"
+            doctor_check_coverage "$wt_path" "$label" "$stable" "$local_probes"
+        done < <(registered_worktrees)
+        if [[ "$DOCTOR_FAILURES" -eq 0 ]]; then
+            d_ok "provisioning: hooks, conf and ignore coverage check out"
+        fi
+        failures=$((failures + DOCTOR_FAILURES))
     fi
 
     if (( DOCTOR_JSON )); then

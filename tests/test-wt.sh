@@ -1475,6 +1475,103 @@ assert_contains "$output" "already an orchestration dir" "re-convert refusal nam
 cd "$TMP" || exit 1
 
 # ============================================================
+# Test Suite: doctor provisioning checks
+# ============================================================
+test_suite "doctor provisioning checks"
+
+# A dedicated fixture: these tests deliberately break the conf, the hooks and
+# the ignore rules one at a time, and none of that should reach the other
+# suites' projects.
+make_remote "$TMP/r3.git"
+"$WT" init "$TMP/r3.git" "$TMP/p3" >/dev/null 2>&1
+cd "$TMP/p3" || exit 1
+
+output=$("$WT" doctor 2>&1)
+assert_equals 0 $? "doctor passes on a fresh orchestration dir"
+assert_contains "$output" "provisioning: hooks, conf and ignore coverage check out" \
+    "doctor reports the provisioning group when it is clean"
+
+# run_hook silently skips a hook that is not executable, which is the whole
+# reason this is worth a check.
+mkdir -p local/hooks
+printf '#!/usr/bin/env bash\nexit 0\n' > local/hooks/post-add
+output=$("$WT" doctor 2>&1)
+assert_not_equals 0 $? "a non-executable hook fails doctor"
+assert_contains "$output" "not executable" "doctor names the non-executable hook"
+assert_contains "$output" "chmod +x" "doctor names the fix for it"
+chmod +x local/hooks/post-add
+"$WT" doctor >/dev/null 2>&1
+assert_equals 0 $? "an executable hook passes"
+
+printf '#!/usr/bin/env bash\nexit 0\n' > local/hooks/post-create
+chmod +x local/hooks/post-create
+assert_contains "$("$WT" doctor 2>&1)" "matches no hook stage" \
+    "a hook named for no real stage is reported"
+rm -f local/hooks/post-create
+
+# The silent conf failures: read_conf substitutes its default and says
+# nothing, so a value that was set and a value that was read differ.
+printf 'CACHE_PATHS=node_modules, .venv\n' > main/.worktree.conf
+assert_contains "$("$WT" doctor 2>&1)" "CACHE_PATHS is set but no value is read from it" \
+    "a space in a conf list is reported rather than silently dropped"
+
+printf '  CACHE_PATHS=node_modules\n' > main/.worktree.conf
+assert_contains "$("$WT" doctor 2>&1)" "CACHE_PATHS is set but no value is read from it" \
+    "an indented conf key is reported"
+
+printf 'CACHE_PATHS =node_modules\n' > main/.worktree.conf
+assert_contains "$("$WT" doctor 2>&1)" "CACHE_PATHS is set but no value is read from it" \
+    "a space before the conf separator is reported"
+
+printf 'CACHE_PATHS=\n' > main/.worktree.conf
+assert_not_contains "$("$WT" doctor 2>&1)" "CACHE_PATHS is set but" \
+    "a deliberately emptied key is a choice, not a finding"
+
+printf 'CACHE_MODE=symlink\n' > main/.worktree.conf
+assert_contains "$("$WT" doctor 2>&1)" "CACHE_MODE=symlink is not a mode" \
+    "an unrecognised CACHE_MODE is reported instead of quietly meaning copy"
+
+printf 'CACHE_MODE=copy\nCACHE_MODE=link\n' > main/.worktree.conf
+assert_contains "$("$WT" doctor 2>&1)" "CACHE_MODE is set 2 times" \
+    "a duplicated key notes that the first one wins"
+
+# Ignore coverage: the same rule add and sync enforce, asked ahead of time.
+printf 'CACHE_PATHS=node_modules\n' > main/.worktree.conf
+mkdir -p main/node_modules
+output=$("$WT" doctor 2>&1)
+assert_not_equals 0 $? "an unignored cache path fails doctor"
+assert_contains "$output" "CACHE_PATHS names 'node_modules/'" \
+    "an unignored cache path is reported before add fails on it"
+
+printf 'node_modules/\n' >> main/.gitignore
+assert_not_contains "$("$WT" doctor 2>&1)" "CACHE_PATHS names" \
+    "ignoring the cache path clears the finding"
+
+printf 'secret\n' > local/shared/notignored.txt
+output=$("$WT" doctor 2>&1)
+assert_contains "$output" "local/ provisions 'notignored.txt'" \
+    "an unignored local/ destination is reported"
+rm -f local/shared/notignored.txt
+
+# An absent cache path is normal on a checkout nobody has built yet, so it
+# is a note and must not fail the run.
+printf 'CACHE_PATHS=node_modules,dist\n' > main/.worktree.conf
+printf 'dist/\n' >> main/.gitignore
+output=$("$WT" doctor 2>&1)
+assert_equals 0 $? "a cache path absent from the stable checkout does not fail doctor"
+assert_contains "$output" "is absent from" "an absent cache path is reported as a note"
+
+# write_worktree_env returns success when .env.worktree is not ignored, so
+# nothing but doctor ever reports the worktree that got no port block.
+printf 'node_modules/\ndist/\n' > main/.gitignore
+output=$("$WT" doctor 2>&1)
+assert_not_equals 0 $? "an unignored .env.worktree fails doctor"
+assert_contains "$output" "no runtime identity and no port block" \
+    "doctor explains what the missing ignore rule costs"
+
+cd "$TMP" || exit 1
+
+# ============================================================
 # Summary
 # ============================================================
 print_test_summary
