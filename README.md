@@ -62,7 +62,7 @@ container up|exec ...       manage the worktree's dev container (host only)
 remove <name> [--branch]    remove a worktree + its containers (refuses dirty)
 prune                       clean up stale worktree administrative entries
 ignore [--print] [path]     write a workspace .ignore so searches skip worktrees (default: .)
-doctor [--json]             check layout, git version, pointers, and tooling
+doctor [--json]             check layout, git version, pointers, tooling, and provisioning config
 version [--json]            print the version and where this executable came from
 ```
 
@@ -91,6 +91,9 @@ wt container exec clk-456 -- npm test
 ```
 
 `wt doctor` checks the layout, git version, worktree pointers, and tooling, and names the fix for what it finds.
+It also checks that provisioning will do what the project declared: hooks that are executable and named for a real stage,
+`.dev/worktree.conf` values that actually parse, and the gitignore rules `local/`, `CACHE_PATHS` and `.env.worktree` depend on.
+Those failures are otherwise silent -- an unparsed `CACHE_PATHS` disables cache sharing without a word, and an unignored `.env.worktree` leaves a worktree with no port block while `add` still reports success.
 `wt ignore` writes a workspace `.ignore` so searches rooted above the worktrees do not descend into every checkout.
 
 A reference devcontainer template lives in [`examples/devcontainer/`](examples/devcontainer/).
