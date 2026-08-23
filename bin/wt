@@ -93,7 +93,7 @@ command_spec() {
         path)         printf '%s\t%s' 'path [name]'              "print the worktree's path (default: main)" ;;
         pull)         printf '%s\t%s' 'pull [name]'              "fetch origin and fast-forward a worktree to origin/<branch> (default: main)" ;;
         git)          printf '%s\t%s' 'git <name> <git-args...>' 'run git in the named worktree (verbatim pass-through)' ;;
-        sync)         printf '%s\t%s' 'sync [name|--all] [--diff]' "refresh local/shared into a worktree (default: main); --diff previews drift" ;;
+        sync)         printf '%s\t%s' 'sync [name|--all] [--diff]' "refresh local/ files and shared caches into a worktree (default: main); --diff previews drift" ;;
         container)    printf '%s\t%s' 'container up|exec ...'    "manage the worktree's dev container (host only)" ;;
         remove)       printf '%s\t%s' 'remove <name> [--branch]' 'remove a worktree + its containers (refuses dirty)' ;;
         prune)        printf '%s\t%s' 'prune'                    'clean up stale worktree administrative entries' ;;
@@ -179,8 +179,15 @@ NOTE
   one pass. local/shared is overwritten in the worktree; local/template is
   never touched after the initial copy.
 
+  The build caches named by CACHE_PATHS in .worktree.conf are then
+  shared in, the same way add does it: only where the worktree has no copy
+  of its own, so a cache it has since built is never replaced. This is what
+  brings a worktree created before the conf existed up to date without
+  recreating it.
+
   --diff previews instead of copying: one line per missing or differing
-  file, exit 1 on drift, nothing written. Combines with --all.
+  file under local/shared, exit 1 on drift, nothing written. Caches are not
+  part of the preview. Combines with --all.
 NOTE
         ;;
         container) cat <<'NOTE'
@@ -629,6 +636,13 @@ run_hook() {
 
 # ----------------------------------------------------- runtime identity ----
 
+# The tracked project config, relative to a worktree root. A plain root
+# dotfile rather than a directory: it is one flat file, and a repo root
+# already carries ./dev and .devcontainer/, which a .dev/ would sit between
+# and be mistaken for. Named for the domain, not for the executable, which
+# argv0 lets a user rename.
+WT_CONF_REL='.worktree.conf'
+
 # Minimal key=value reader for the tracked project config. Never sources
 # shell from an untrusted checkout; values are charset-restricted.
 read_conf() {
@@ -813,7 +827,7 @@ release_port() {
 # file that already carries an APP_PORT.
 write_worktree_env() {
     local root="$1" worktree="$2" slug="$3"
-    local conf="$worktree/.dev/worktree.conf" pid app_port slug_db envfile content
+    local conf="$worktree/$WT_CONF_REL" pid app_port slug_db envfile content
     envfile="$worktree/.env.worktree"
     pid="$(read_conf "$conf" PROJECT_ID "$(project_id)")"
     if ! git -C "$worktree" check-ignore -q -- .env.worktree; then
@@ -1465,7 +1479,7 @@ cmd_add() {
             rollback_add "$dest" "$branch" "$created_branch"
             die "provisioning failed; worktree rolled back"
         fi
-        if ! share_build_caches "$WT_ROOT" "$dest" "$dest/.dev/worktree.conf"; then
+        if ! share_build_caches "$WT_ROOT" "$dest" "$dest/$WT_CONF_REL"; then
             rollback_add "$dest" "$branch" "$created_branch"
             die "cache sharing failed; worktree rolled back"
         fi
@@ -1667,6 +1681,13 @@ cmd_sync() {
             fi
             if provision_local_files "$WT_ROOT" "$wt_path"; then
                 log "synced local/ into $wt_path"
+                # After provisioning, because the conf that names the cache
+                # paths can itself arrive from local/ in this same pass.
+                if ! share_build_caches "$WT_ROOT" "$wt_path" "$wt_path/$WT_CONF_REL"; then
+                    log "WARNING: cache sharing failed for $wt_path"
+                    failures=$((failures + 1))
+                    continue
+                fi
                 if ! write_worktree_env "$WT_ROOT" "$wt_path" "$(basename "$wt_path")"; then
                     log "WARNING: could not assign a port block for $wt_path"
                     failures=$((failures + 1))
@@ -1688,6 +1709,8 @@ cmd_sync() {
     run_hook pre-sync "$WT_ROOT" "$dest" || die "pre-sync hook failed; nothing copied"
     provision_local_files "$WT_ROOT" "$dest" || die "sync failed validation; nothing copied"
     log "synced local/ into $dest"
+    share_build_caches "$WT_ROOT" "$dest" "$dest/$WT_CONF_REL" \
+        || die "cache sharing failed for $dest"
     write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")" \
         || die "could not assign a port block for $dest"
     run_hook post-sync "$WT_ROOT" "$dest"
