@@ -55,9 +55,9 @@ add <name|pr:N> [base]      create a worktree (+ provision local files in orches
 go [name]                   cd into a worktree (no name: the stable checkout)
 list [--names|--json]       list worktrees for the current project
 path [name]                 print the worktree's path (default: main)
-pull [name]                 fetch origin and fast-forward a worktree to origin/<branch> (default: main)
+pull [name|--all]           fetch origin and fast-forward a worktree to origin/<branch> (default: the one you are in)
 git <name> <git-args...>    run git in the named worktree (verbatim pass-through)
-sync [name|--all] [--diff]  refresh local/ files and shared caches into a worktree (default: main); --diff previews drift
+sync [name|--all] [--diff]  refresh local/ files and shared caches into a worktree (default: the one you are in); --diff previews drift
 container up|exec ...       manage the worktree's dev container (host only)
 remove <name> [--branch]    remove a worktree + its containers (refuses dirty)
 prune                       clean up stale worktree administrative entries
@@ -65,6 +65,10 @@ ignore [--print] [path]     write a workspace .ignore so searches skip worktrees
 doctor [--json]             check layout, git version, pointers, tooling, and provisioning config
 version [--json]            print the version and where this executable came from
 ```
+
+Commands that act on a worktree -- `pull`, `sync`, `container up`, `container exec` -- default to the worktree you are standing in, and to the stable checkout when you are outside every worktree.
+`go` and `path` deliberately keep meaning the stable checkout, since answering "where is main" from inside a worktree is what the bare form is for.
+`add`, `remove` and `git` always need a name.
 
 Run `wt <command> --help` for detail on one command.
 Paths go to stdout and logging to stderr, so command substitution is safe: `cd "$(wt add feature-x)"`.
