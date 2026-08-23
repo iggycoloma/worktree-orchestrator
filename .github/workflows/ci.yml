@@ -33,3 +33,22 @@ jobs:
       - name: test suite (bash 3.2)
         if: runner.os == 'macOS'
         run: /bin/bash tests/test-wt.sh
+
+  # Single stable context for branch protection: the ruleset requires
+  # "CI Summary" rather than enumerating matrix legs, so adding an OS to
+  # the test matrix never desynchronizes the required-checks list.
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [shellcheck, test]
+    if: always()
+    steps:
+      - name: check job results
+        run: |
+          if [ "${{ needs.shellcheck.result }}" = "success" ] && \
+             [ "${{ needs.test.result }}" = "success" ]; then
+            echo "all checks passed"
+          else
+            echo "shellcheck: ${{ needs.shellcheck.result }}, test: ${{ needs.test.result }}"
+            exit 1
+          fi
