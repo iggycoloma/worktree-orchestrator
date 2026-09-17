@@ -34,6 +34,7 @@ _wt() {
         'prune:clean up stale worktree administrative entries'
         'ignore:write a workspace .ignore so searches skip worktrees'
         'doctor:check layout, git version, pointers, and tooling'
+        'shell-init:print shell integration (cd wrapper + completion)'
         'version:print the version and where this executable came from'
         'help:show help for a command'
     )
@@ -94,6 +95,8 @@ _wt() {
             _values 'flag' \
                 '--names[print bare directory names, one per line]' \
                 '--json[print one object with every worktree]' ;;
+        shell-init)
+            (( CURRENT == 3 )) && _values 'shell' bash zsh ;;
         doctor|version)
             _values 'flag' '--json[print structured output instead of log lines]' ;;
         convert)

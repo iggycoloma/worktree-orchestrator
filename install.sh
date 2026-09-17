@@ -10,7 +10,8 @@
 #       second clone
 #
 # Installs symlinks under PREFIX (default ~/.local): bin/wt plus the bash
-# and zsh completions. Re-runnable; a dirty or diverged managed checkout is
+# and zsh completions, then prints the shell-init line that turns on
+# 'wt go' and completion. Re-runnable; a dirty or diverged managed checkout is
 # kept, never clobbered. Override WT_ORCH_REPO / WT_ORCH_DIR / PREFIX via
 # the environment.
 #
@@ -70,6 +71,17 @@ main() {
         || warn "flock not found; port allocation needs it (util-linux on Linux, 'brew install flock' on macOS)"
 
     "$PREFIX/bin/wt" version >&2
+
+    # 'wt go' can only cd from a shell function, and zsh only completes wt
+    # once the completion dir is registered; both come from this one line.
+    # Printed rather than appended: the installer never edits startup files.
+    local shell_name="${SHELL:-}"
+    case "${shell_name##*/}" in
+        zsh) shell_name=zsh ;;
+        *)   shell_name=bash ;;
+    esac
+    log "to enable 'wt go' and tab completion, add this line to ~/.${shell_name}rc:"
+    log "  eval \"\$(wt shell-init $shell_name)\""
 }
 
 main "$@"

@@ -38,13 +38,25 @@ From an existing checkout, `./install.sh` (or `make install`) installs from that
 Make sure `$PREFIX/bin` is on your `PATH`.
 `make uninstall` removes the symlinks.
 
-Bash completion is picked up automatically where the bash-completion package scans `$PREFIX/share/bash-completion/completions`.
-For zsh, put the site-functions dir on `fpath` before `compinit` runs:
+Then add one line to your shell's startup file (the installer prints the one for your shell):
 
-```zsh
-fpath=(~/.local/share/zsh/site-functions $fpath)
-autoload -Uz compinit && compinit
+```bash
+eval "$(wt shell-init zsh)"     # ~/.zshrc
+eval "$(wt shell-init bash)"    # ~/.bashrc
 ```
+
+That line does two things.
+It defines the `wt` shell function that lets `wt go` and `wt add` change directory --
+a child process cannot change its parent shell's directory, so without the function `wt go` only prints the path.
+It also registers tab completion, so `wt go clk<Tab>` expands to the worktree name.
+In zsh the line works on either side of `compinit`: before it, the completion dir goes on `fpath` for `compinit` to scan; after it, the completion is bound directly.
+If nothing in your `~/.zshrc` runs `compinit` yet (no framework such as Oh My Zsh), add `autoload -Uz compinit && compinit` too.
+
+To check a zsh session: `type wt` should report a shell function, and `print ${_comps[wt]}` should print `_wt`.
+
+Completion alone also works without the line:
+bash picks it up where the bash-completion package scans `$PREFIX/share/bash-completion/completions`,
+and zsh finds it when `~/.local/share/zsh/site-functions` is on `fpath` before `compinit` runs.
 
 ## Commands
 
@@ -63,6 +75,7 @@ remove <name> [--branch]    remove a worktree + its containers (refuses dirty)
 prune                       clean up stale worktree administrative entries
 ignore [--print] [path]     write a workspace .ignore so searches skip worktrees (default: .)
 doctor [--json]             check layout, git version, pointers, tooling, and provisioning config
+shell-init <bash|zsh>       print shell integration: the cd wrapper for go/add, and completion
 version [--json]            print the version and where this executable came from
 ```
 

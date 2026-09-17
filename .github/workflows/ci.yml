@@ -26,6 +26,11 @@ jobs:
       - name: install flock
         if: runner.os == 'macOS'
         run: brew install flock
+      # The zsh completion and shell-init checks skip themselves without
+      # zsh; macOS ships it, the Ubuntu image does not.
+      - name: install zsh
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
       - name: test suite
         run: bash tests/test-wt.sh
       # macOS ships bash 3.2 at /bin/bash, which is wt's declared floor;

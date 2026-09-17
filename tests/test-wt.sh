@@ -942,6 +942,69 @@ else
 fi
 
 # ============================================================
+# Test Suite: shell-init
+# ============================================================
+test_suite "shell-init"
+
+"$WT" shell-init >/dev/null 2>&1
+assert_not_equals 0 $? "shell-init without a shell is a usage error"
+output=$("$WT" shell-init fish 2>&1)
+assert_not_equals 0 $? "shell-init rejects a shell it has no integration for"
+assert_contains "$output" "unsupported shell" "shell-init names the unsupported shell"
+
+# The function resolves the executable through PATH ('command wt'), so the
+# checkout's bin/ goes first. Each probe prints what the interactive user
+# would observe: the cwd after the call, or the passed-through output.
+shell_init_probe() {
+    local shell="$1" body="$2"
+    # shellcheck disable=SC2016  # the expansions are for the probed shell, not this one
+    PATH="$ROOT/bin:$PATH" "$shell" "${@:3}" -c '
+        cd "'"$TMP"'/pullproj" || exit 1
+        eval "$(wt shell-init '"$shell"')"
+        '"$body"'
+    ' 2>/dev/null
+}
+
+shell_init_suite() {
+    local shell="$1"; shift
+    assert_equals "$feature" "$(shell_init_probe "$shell" 'wt go pull-feature; pwd -P' "$@")" \
+        "$shell: wt go changes into the worktree"
+    assert_equals "$feature" "$(shell_init_probe "$shell" 'wt go pull-f; pwd -P' "$@")" \
+        "$shell: wt go resolves a prefix"
+    assert_equals "$TMP/pullproj" "$(shell_init_probe "$shell" 'wt go no-such-tree; pwd -P' "$@")" \
+        "$shell: a failed lookup leaves the cwd alone"
+    assert_equals "1" "$(shell_init_probe "$shell" 'wt go no-such-tree; echo $?' "$@")" \
+        "$shell: a failed lookup keeps the executable's exit status"
+    output=$(shell_init_probe "$shell" 'wt go --help; pwd -P' "$@")
+    assert_contains "$output" "Usage: wt go" "$shell: wt go --help passes the help text through"
+    assert_contains "$output" "$TMP/pullproj" "$shell: wt go --help does not change directory"
+    assert_contains "$(shell_init_probe "$shell" 'wt list --names' "$@")" "pull-feature" \
+        "$shell: other commands pass straight through"
+}
+
+shell_init_suite bash --noprofile --norc
+assert_contains "$(shell_init_probe bash 'complete -p wt' --noprofile --norc)" "_wt" \
+    "bash: shell-init registers completion"
+
+if command -v zsh >/dev/null 2>&1; then
+    shell_init_suite zsh -f
+    # shellcheck disable=SC2016  # the expansions are for zsh, not this shell
+    comps_wt=$(shell_init_probe zsh '
+        autoload -Uz compinit
+        compinit -u -d "'"$TMP"'/zcompdump-before"
+        print -r -- ${_comps[wt]}' -f)
+    assert_equals "_wt" "$comps_wt" "zsh: shell-init before compinit gets wt bound through fpath"
+    comps_wt=$(PATH="$ROOT/bin:$PATH" zsh -f -c '
+        autoload -Uz compinit
+        compinit -u -d "'"$TMP"'/zcompdump-after"
+        eval "$(wt shell-init zsh)"
+        print -r -- ${_comps[wt]}' 2>/dev/null)
+    assert_equals "_wt" "$comps_wt" "zsh: shell-init after compinit binds wt directly"
+else
+    echo "  (zsh not installed -- skipping zsh shell-init checks)"
+fi
+
+# ============================================================
 # Test Suite: version and rename-aware output
 # ============================================================
 test_suite "version and rename-aware output"

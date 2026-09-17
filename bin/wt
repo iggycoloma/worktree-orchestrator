@@ -78,7 +78,7 @@ wt_realpath() {
 
 # ------------------------------------------------------------------ help ----
 
-WT_COMMANDS=(init convert add go list path pull git sync container remove prune ignore doctor version)
+WT_COMMANDS=(init convert add go list path pull git sync container remove prune ignore doctor shell-init version)
 
 # Single source of truth per command: "<synopsis>\t<description>". The
 # command table, per-command --help, and every usage error read from here,
@@ -99,6 +99,7 @@ command_spec() {
         prune)        printf '%s\t%s' 'prune'                    'clean up stale worktree administrative entries' ;;
         ignore)       printf '%s\t%s' 'ignore [--print] [path]'  'write a workspace .ignore so searches skip worktrees (default: .)' ;;
         doctor)       printf '%s\t%s' 'doctor [--json]'          'check layout, git version, pointers, tooling, and provisioning config' ;;
+        shell-init)   printf '%s\t%s' 'shell-init <bash|zsh>'    'print shell integration: the cd wrapper for go/add, and completion' ;;
         version)      printf '%s\t%s' 'version [--json]'         'print the version and where this executable came from' ;;
         *) return 1 ;;
     esac
@@ -164,7 +165,8 @@ NOTE
   way.
 
   Only the shell function changes directory; the binary prints the path,
-  which is what makes `cd "$(@WT@ go x)"` work from scripts.
+  which is what makes `cd "$(@WT@ go x)"` work from scripts. The function
+  comes from '@WT@ shell-init' -- without it, go just prints.
 NOTE
         ;;
         list) cat <<'NOTE'
@@ -270,6 +272,22 @@ NOTE
   '@WT@ git main log --help' shows git's help, not @WT@'s. Equivalent to
   git -C "$(@WT@ path <name>)" <git-args...>, with no @WT@ policy applied --
   '@WT@ git main pull' bypasses the fast-forward guard that '@WT@ pull' adds.
+NOTE
+        ;;
+        shell-init) cat <<'NOTE'
+  Add one line to the shell's startup file:
+
+    eval "$(@WT@ shell-init zsh)"     # ~/.zshrc
+    eval "$(@WT@ shell-init bash)"    # ~/.bashrc
+
+  A child process cannot change its parent shell's directory, so the cd
+  behind '@WT@ go' and '@WT@ add' has to be a shell function. The function
+  calls the executable and changes into the path it prints; output that is
+  not a directory (--help, add --json) passes through untouched.
+
+  The same line registers tab completion. In zsh it works on either side of
+  compinit: before, it puts the completion dir on fpath for compinit to
+  scan; after, it binds the completion directly.
 NOTE
         ;;
         remove) cat <<'NOTE'
@@ -2051,6 +2069,62 @@ cmd_ignore() {
     log "wrote $root/.ignore"
 }
 
+# The completion dir is resolved from the real executable rather than from an
+# install prefix, so the output is right for a symlinked install, a checkout
+# on PATH, and any PREFIX alike.
+cmd_shell_init() {
+    check_args shell-init 1 1 "$@"
+    local shell="$1" compdir
+    case "$shell" in
+        bash|zsh) ;;
+        *) die "unsupported shell: $shell (usage: $(command_synopsis shell-init))" ;;
+    esac
+    compdir="$(dirname "$(dirname "$(wt_realpath "$0")")")/completions"
+
+    # 'command' skips the function itself. Help and --json share stdout with
+    # the path, so only an existing directory is treated as a destination.
+    cat <<SH
+$WT_NAME() {
+    case "\${1:-}" in
+        add|go)
+            local dest
+            dest="\$(command $WT_NAME "\$@")" || return \$?
+            if [ -d "\$dest" ]; then
+                cd "\$dest" || return 1
+            elif [ -n "\$dest" ]; then
+                printf '%s\n' "\$dest"
+            fi
+            ;;
+        *)
+            command $WT_NAME "\$@"
+            ;;
+    esac
+}
+SH
+
+    local quoted
+    printf -v quoted '%q' "$compdir"
+    if [[ "$shell" == "zsh" ]]; then
+        cat <<SH
+() {
+    local compdir=$quoted
+    [[ -r \$compdir/_wt ]] || return 0
+    (( \${fpath[(Ie)\$compdir]} )) || fpath=(\$compdir \$fpath)
+    if (( \$+functions[compdef] )); then
+        autoload -Uz _wt
+        compdef _wt $WT_NAME
+    fi
+}
+SH
+    else
+        cat <<SH
+if [[ -r $quoted/wt.bash ]]; then
+    source $quoted/wt.bash
+fi
+SH
+    fi
+}
+
 # The executable is deployed as a symlink into a checkout that moves and can
 # be renamed, so the version number alone does not identify what answered.
 # Resolving the link and reading the checkout's commit is what makes a bug
@@ -2453,6 +2527,7 @@ case "$command_name" in
     prune)        cmd_prune "$@" ;;
     ignore)       cmd_ignore "$@" ;;
     doctor)       cmd_doctor "$@" ;;
+    shell-init)   cmd_shell_init "$@" ;;
     version)      cmd_version "$@" ;;
     *) die "unknown command: $command_name (see '$WT_NAME --help')" ;;
 esac
