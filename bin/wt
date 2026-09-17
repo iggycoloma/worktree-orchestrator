@@ -78,7 +78,7 @@ wt_realpath() {
 
 # ------------------------------------------------------------------ help ----
 
-WT_COMMANDS=(init convert add go list path pull git sync container remove prune ignore doctor version)
+WT_COMMANDS=(init convert add go list path pull git sync container remove prune ignore doctor shell-init version)
 
 # Single source of truth per command: "<synopsis>\t<description>". The
 # command table, per-command --help, and every usage error read from here,
@@ -99,6 +99,7 @@ command_spec() {
         prune)        printf '%s\t%s' 'prune'                    'clean up stale worktree administrative entries' ;;
         ignore)       printf '%s\t%s' 'ignore [--print] [path]'  'write a workspace .ignore so searches skip worktrees (default: .)' ;;
         doctor)       printf '%s\t%s' 'doctor [--json]'          'check layout, git version, pointers, tooling, and provisioning config' ;;
+        shell-init)   printf '%s\t%s' 'shell-init <bash|zsh|fish>' 'print shell integration: the cd wrapper for go/add, and completion' ;;
         version)      printf '%s\t%s' 'version [--json]'         'print the version and where this executable came from' ;;
         *) return 1 ;;
     esac
@@ -164,7 +165,8 @@ NOTE
   way.
 
   Only the shell function changes directory; the binary prints the path,
-  which is what makes `cd "$(@WT@ go x)"` work from scripts.
+  which is what makes `cd "$(@WT@ go x)"` work from scripts. The function
+  comes from '@WT@ shell-init' -- without it, go just prints.
 NOTE
         ;;
         list) cat <<'NOTE'
@@ -270,6 +272,30 @@ NOTE
   '@WT@ git main log --help' shows git's help, not @WT@'s. Equivalent to
   git -C "$(@WT@ path <name>)" <git-args...>, with no @WT@ policy applied --
   '@WT@ git main pull' bypasses the fast-forward guard that '@WT@ pull' adds.
+NOTE
+        ;;
+        shell-init) cat <<'NOTE'
+  Add one line to the shell's startup file:
+
+    eval "$(@WT@ shell-init zsh)"     # ~/.zshrc
+    eval "$(@WT@ shell-init bash)"    # ~/.bashrc
+    @WT@ shell-init fish | source     # ~/.config/fish/config.fish
+
+  fish needs the line only for an install outside ~/.local: install.sh
+  links the function and completion into fish's vendor directories, which
+  fish loads from on its own.
+
+  A child process cannot change its parent shell's directory, so the cd
+  behind '@WT@ go' and '@WT@ add' has to be a shell function. The function
+  calls the executable and changes into the path it prints; output that is
+  not a directory (--help, add --json) passes through untouched.
+
+  The same line registers tab completion. In zsh it works on either side of
+  compinit: before, it puts the completion dir on fpath for compinit to
+  scan; after, it binds the completion directly.
+
+  Without the function, '@WT@ go' at a terminal prints the path and says so;
+  '@WT@ doctor' reports whether the calling shell has it loaded.
 NOTE
         ;;
         remove) cat <<'NOTE'
@@ -1644,6 +1670,7 @@ cmd_list() {
 cmd_go() {
     check_args go 0 1 "$@"
     cmd_path "$@"
+    shell_integration_hint
 }
 
 cmd_path() {
@@ -2051,6 +2078,139 @@ cmd_ignore() {
     log "wrote $root/.ignore"
 }
 
+# The shell this user would put an integration line in, from $SHELL; empty
+# for one shell-init has no output for.
+integration_shell() {
+    local shell="${SHELL:-}"
+    case "${shell##*/}" in
+        bash|zsh|fish) printf '%s' "${shell##*/}" ;;
+    esac
+}
+
+# The line that loads shell-init in the given shell, and the file it goes in.
+integration_line() {
+    # shellcheck disable=SC2016  # the $( ) is text for the user to paste
+    case "$1" in
+        fish) printf '%s shell-init fish | source    (in ~/.config/fish/config.fish)' "$WT_NAME" ;;
+        *)    printf 'eval "$(%s shell-init %s)"    (in ~/.%src)' "$WT_NAME" "$1" "$1" ;;
+    esac
+}
+
+# 'go' run bare at a prompt prints a path and leaves the user where they
+# were, which reads as a bug. Only the function sets WT_SHELL_INTEGRATION,
+# and only an interactive call has a terminal on stdout, so scripts and
+# agents using cd "$(wt go x)" never see this.
+shell_integration_hint() {
+    [[ -z "${WT_SHELL_INTEGRATION:-}" && -t 1 ]] || return 0
+    local shell
+    shell="$(integration_shell)"
+    if [[ -n "$shell" ]]; then
+        log "printed the path only: the shell function that changes directory is not loaded. Add: $(integration_line "$shell")"
+    else
+        log "printed the path only: the shell function that changes directory is not loaded (see '$WT_NAME shell-init --help')"
+    fi
+}
+
+# Single quotes are fish's only fully literal quoting; inside them just
+# backslash and the quote itself need escaping.
+fish_quote() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\'/\\\'}"
+    printf "'%s'" "$s"
+}
+
+# fish splits command substitution output into one element per line, so a
+# lone element naming a directory is the destination and anything else
+# (help, add --json) is printed back line by line.
+shell_init_fish() {
+    local compfile
+    compfile="$(fish_quote "$1/wt.fish")"
+    cat <<SH
+function $WT_NAME
+    set -lx WT_SHELL_INTEGRATION 1
+    switch "\$argv[1]"
+        case add go
+            set -l dest (command $WT_NAME \$argv)
+            or return \$status
+            if test (count \$dest) -eq 1; and test -d "\$dest[1]"
+                cd \$dest[1]
+            else if test (count \$dest) -gt 0
+                printf '%s\n' \$dest
+            end
+        case '*'
+            command $WT_NAME \$argv
+    end
+end
+if test -r $compfile
+    source $compfile
+end
+SH
+}
+
+# The completion dir is resolved from the real executable rather than from an
+# install prefix, so the output is right for a symlinked install, a checkout
+# on PATH, and any PREFIX alike.
+cmd_shell_init() {
+    check_args shell-init 1 1 "$@"
+    local shell="$1" compdir
+    case "$shell" in
+        bash|zsh|fish) ;;
+        *) die "unsupported shell: $shell (usage: $(command_synopsis shell-init))" ;;
+    esac
+    compdir="$(dirname "$(dirname "$(wt_realpath "$0")")")/completions"
+
+    if [[ "$shell" == "fish" ]]; then
+        shell_init_fish "$compdir"
+        return 0
+    fi
+
+    # 'command' skips the function itself. Help and --json share stdout with
+    # the path, so only an existing directory is treated as a destination.
+    # WT_SHELL_INTEGRATION is how the executable knows the function is what
+    # called it (see shell_integration_hint).
+    cat <<SH
+$WT_NAME() {
+    case "\${1:-}" in
+        add|go)
+            local dest
+            dest="\$(WT_SHELL_INTEGRATION=1 command $WT_NAME "\$@")" || return \$?
+            if [ -d "\$dest" ]; then
+                cd "\$dest" || return 1
+            elif [ -n "\$dest" ]; then
+                printf '%s\n' "\$dest"
+            fi
+            ;;
+        *)
+            WT_SHELL_INTEGRATION=1 command $WT_NAME "\$@"
+            ;;
+    esac
+}
+SH
+
+    local quoted
+    printf -v quoted '%q' "$compdir"
+    if [[ "$shell" == "zsh" ]]; then
+        cat <<SH
+() {
+    local compdir=$quoted
+    [[ -r \$compdir/_wt ]] || return 0
+    (( \${fpath[(Ie)\$compdir]} )) || fpath=(\$compdir \$fpath)
+    if (( \$+functions[compdef] )); then
+        autoload -Uz _wt
+        compdef _wt $WT_NAME
+    fi
+}
+SH
+    else
+        cat <<SH
+if [[ -r $quoted/wt.bash ]]; then
+    source $quoted/wt.bash
+fi
+SH
+    fi
+}
+
 # The executable is deployed as a symlink into a checkout that moves and can
 # be renamed, so the version number alone does not identify what answered.
 # Resolving the link and reading the checkout's commit is what makes a bug
@@ -2258,6 +2418,14 @@ cmd_doctor() {
     d_ok "mode: $WT_MODE"
     d_ok "root: $WT_ROOT"
 
+    # A note, never a failure: scripts and agents call the executable
+    # directly and have no use for the function.
+    if [[ -n "${WT_SHELL_INTEGRATION:-}" ]]; then
+        d_ok "shell integration: loaded"
+    else
+        d_note "shell integration not loaded in the calling shell, so '$WT_NAME go' only prints the path (see '$WT_NAME shell-init --help')"
+    fi
+
     git_version="$(git --version | awk '{print $3}')"
     if version_at_least "$git_version" "$WT_MIN_GIT"; then
         d_ok "git $git_version (>= $WT_MIN_GIT: relative worktree paths available)"
@@ -2453,6 +2621,7 @@ case "$command_name" in
     prune)        cmd_prune "$@" ;;
     ignore)       cmd_ignore "$@" ;;
     doctor)       cmd_doctor "$@" ;;
+    shell-init)   cmd_shell_init "$@" ;;
     version)      cmd_version "$@" ;;
     *) die "unknown command: $command_name (see '$WT_NAME --help')" ;;
 esac
