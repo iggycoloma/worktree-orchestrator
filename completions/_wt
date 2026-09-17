@@ -96,7 +96,7 @@ _wt() {
                 '--names[print bare directory names, one per line]' \
                 '--json[print one object with every worktree]' ;;
         shell-init)
-            (( CURRENT == 3 )) && _values 'shell' bash zsh ;;
+            (( CURRENT == 3 )) && _values 'shell' bash zsh fish ;;
         doctor|version)
             _values 'flag' '--json[print structured output instead of log lines]' ;;
         convert)

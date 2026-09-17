@@ -9,9 +9,9 @@
 #       run from inside a checkout, installs from that checkout -- no
 #       second clone
 #
-# Installs symlinks under PREFIX (default ~/.local): bin/wt plus the bash
-# and zsh completions, then prints the shell-init line that turns on
-# 'wt go' and completion. Re-runnable; a dirty or diverged managed checkout is
+# Installs symlinks under PREFIX (default ~/.local): bin/wt plus the bash,
+# zsh and fish completions and the fish function, then prints what the
+# user's shell still needs for 'wt go' and completion. Re-runnable; a dirty or diverged managed checkout is
 # kept, never clobbered. Override WT_ORCH_REPO / WT_ORCH_DIR / PREFIX via
 # the environment.
 #
@@ -55,10 +55,14 @@ main() {
 
     mkdir -p "$PREFIX/bin" \
         "$PREFIX/share/bash-completion/completions" \
-        "$PREFIX/share/zsh/site-functions"
+        "$PREFIX/share/zsh/site-functions" \
+        "$PREFIX/share/fish/vendor_completions.d" \
+        "$PREFIX/share/fish/vendor_functions.d"
     ln -sf "$src/bin/wt" "$PREFIX/bin/wt"
     ln -sf "$src/completions/wt.bash" "$PREFIX/share/bash-completion/completions/wt"
     ln -sf "$src/completions/_wt" "$PREFIX/share/zsh/site-functions/_wt"
+    ln -sf "$src/completions/wt.fish" "$PREFIX/share/fish/vendor_completions.d/wt.fish"
+    ln -sf "$src/functions/wt.fish" "$PREFIX/share/fish/vendor_functions.d/wt.fish"
     log "installed: $PREFIX/bin/wt -> $src/bin/wt"
 
     case ":$PATH:" in
@@ -72,16 +76,34 @@ main() {
 
     "$PREFIX/bin/wt" version >&2
 
-    # 'wt go' can only cd from a shell function, and zsh only completes wt
-    # once the completion dir is registered; both come from this one line.
-    # Printed rather than appended: the installer never edits startup files.
+    shell_setup_hint
+}
+
+# 'wt go' can only cd from a shell function, and zsh only completes wt once
+# the completion dir is registered; shell-init provides both. Printed rather
+# than appended: the installer never edits startup files.
+shell_setup_hint() {
     local shell_name="${SHELL:-}"
-    case "${shell_name##*/}" in
-        zsh) shell_name=zsh ;;
-        *)   shell_name=bash ;;
+    shell_name="${shell_name##*/}"
+    case "$shell_name" in
+        bash|zsh)
+            log "to enable 'wt go' and tab completion, add this line to ~/.${shell_name}rc:"
+            log "  eval \"\$(wt shell-init $shell_name)\""
+            ;;
+        fish)
+            # fish autoloads from <user data dir>/fish/vendor_*.d, so the
+            # links above are the whole setup unless PREFIX is elsewhere.
+            if [[ "$PREFIX/share" == "${XDG_DATA_HOME:-$HOME/.local/share}" ]]; then
+                log "fish loads 'wt go' and tab completion from $PREFIX/share/fish on its own; open a new shell"
+            else
+                log "to enable 'wt go' and tab completion, add this line to ~/.config/fish/config.fish:"
+                log "  wt shell-init fish | source"
+            fi
+            ;;
+        *)
+            log "'wt go' and tab completion need shell integration, available for bash, zsh and fish: see 'wt shell-init --help'"
+            ;;
     esac
-    log "to enable 'wt go' and tab completion, add this line to ~/.${shell_name}rc:"
-    log "  eval \"\$(wt shell-init $shell_name)\""
 }
 
 main "$@"

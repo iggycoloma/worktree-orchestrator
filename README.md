@@ -25,7 +25,7 @@ It is a single Bash script (3.2 compatible, macOS `/bin/bash` included) with no 
 Requirements: bash 3.2+, git, and rsync.
 Git 2.48+ is recommended (relative worktree pointers; older versions degrade with a warning).
 Orchestration mode also needs flock for the port registry -- Linux has it via util-linux, macOS needs `brew install flock`.
-Optional: docker plus the devcontainer CLI for `wt container`, jq for consuming `--json` output, zsh for zsh completions.
+Optional: docker plus the devcontainer CLI for `wt container`, jq for consuming `--json` output, zsh or fish for their completions.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/iggycoloma/worktree-orchestrator/main/install.sh | bash
@@ -45,7 +45,11 @@ eval "$(wt shell-init zsh)"     # ~/.zshrc
 eval "$(wt shell-init bash)"    # ~/.bashrc
 ```
 
-That line does two things.
+fish needs no line with the default `PREFIX`:
+the installer links the function and completion into `~/.local/share/fish/vendor_functions.d` and `vendor_completions.d`, which fish loads from on its own.
+For another `PREFIX`, add `wt shell-init fish | source` to `~/.config/fish/config.fish`.
+
+The `shell-init` output does two things.
 It defines the `wt` shell function that lets `wt go` and `wt add` change directory --
 a child process cannot change its parent shell's directory, so without the function `wt go` only prints the path.
 It also registers tab completion, so `wt go clk<Tab>` expands to the worktree name.
@@ -53,6 +57,9 @@ In zsh the line works on either side of `compinit`: before it, the completion di
 If nothing in your `~/.zshrc` runs `compinit` yet (no framework such as Oh My Zsh), add `autoload -Uz compinit && compinit` too.
 
 To check a zsh session: `type wt` should report a shell function, and `print ${_comps[wt]}` should print `_wt`.
+In any shell, `wt doctor` reports whether the function is loaded,
+and `wt go` run at a terminal without it prints the path along with the line to add.
+Scripts are unaffected: the hint only appears when stdout is a terminal, so `cd "$(wt go x)"` stays quiet.
 
 Completion alone also works without the line:
 bash picks it up where the bash-completion package scans `$PREFIX/share/bash-completion/completions`,
@@ -75,7 +82,7 @@ remove <name> [--branch]    remove a worktree + its containers (refuses dirty)
 prune                       clean up stale worktree administrative entries
 ignore [--print] [path]     write a workspace .ignore so searches skip worktrees (default: .)
 doctor [--json]             check layout, git version, pointers, tooling, and provisioning config
-shell-init <bash|zsh>       print shell integration: the cd wrapper for go/add, and completion
+shell-init <bash|zsh|fish>  print shell integration: the cd wrapper for go/add, and completion
 version [--json]            print the version and where this executable came from
 ```
 

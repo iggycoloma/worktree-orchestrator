@@ -28,6 +28,9 @@ unset WT_DOTFILES_REPOSITORY DOTFILES_DIR
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
 export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
 export HOME="$TMP/home"
+# An exported XDG dir would keep pointing at the real home: install.sh and
+# fish both resolve their data dir through it before falling back to HOME.
+unset XDG_DATA_HOME XDG_CONFIG_HOME
 mkdir -p "$HOME"
 git config --global init.defaultBranch main
 git config --global worktree.useRelativePaths true
@@ -948,7 +951,7 @@ test_suite "shell-init"
 
 "$WT" shell-init >/dev/null 2>&1
 assert_not_equals 0 $? "shell-init without a shell is a usage error"
-output=$("$WT" shell-init fish 2>&1)
+output=$("$WT" shell-init tcsh 2>&1)
 assert_not_equals 0 $? "shell-init rejects a shell it has no integration for"
 assert_contains "$output" "unsupported shell" "shell-init names the unsupported shell"
 
@@ -956,30 +959,39 @@ assert_contains "$output" "unsupported shell" "shell-init names the unsupported 
 # checkout's bin/ goes first. Each probe prints what the interactive user
 # would observe: the cwd after the call, or the passed-through output.
 shell_init_probe() {
-    local shell="$1" body="$2"
+    local shell="$1" body="$2" load
     # shellcheck disable=SC2016  # the expansions are for the probed shell, not this one
+    case "$shell" in
+        fish) load='wt shell-init fish | source' ;;
+        *)    load='eval "$(wt shell-init '"$shell"')"' ;;
+    esac
     PATH="$ROOT/bin:$PATH" "$shell" "${@:3}" -c '
         cd "'"$TMP"'/pullproj" || exit 1
-        eval "$(wt shell-init '"$shell"')"
+        '"$load"'
         '"$body"'
     ' 2>/dev/null
 }
 
 shell_init_suite() {
-    local shell="$1"; shift
+    # shellcheck disable=SC2016  # expanded by the probed shell, not this one
+    local shell="$1" last_status='$?'; shift
+    # shellcheck disable=SC2016
+    [[ "$shell" != "fish" ]] || last_status='$status'
     assert_equals "$feature" "$(shell_init_probe "$shell" 'wt go pull-feature; pwd -P' "$@")" \
         "$shell: wt go changes into the worktree"
     assert_equals "$feature" "$(shell_init_probe "$shell" 'wt go pull-f; pwd -P' "$@")" \
         "$shell: wt go resolves a prefix"
     assert_equals "$TMP/pullproj" "$(shell_init_probe "$shell" 'wt go no-such-tree; pwd -P' "$@")" \
         "$shell: a failed lookup leaves the cwd alone"
-    assert_equals "1" "$(shell_init_probe "$shell" 'wt go no-such-tree; echo $?' "$@")" \
+    assert_equals "1" "$(shell_init_probe "$shell" "wt go no-such-tree; echo $last_status" "$@")" \
         "$shell: a failed lookup keeps the executable's exit status"
     output=$(shell_init_probe "$shell" 'wt go --help; pwd -P' "$@")
     assert_contains "$output" "Usage: wt go" "$shell: wt go --help passes the help text through"
     assert_contains "$output" "$TMP/pullproj" "$shell: wt go --help does not change directory"
     assert_contains "$(shell_init_probe "$shell" 'wt list --names' "$@")" "pull-feature" \
         "$shell: other commands pass straight through"
+    assert_contains "$(shell_init_probe "$shell" 'wt doctor 2>&1' "$@")" "shell integration: loaded" \
+        "$shell: doctor sees the function's marker"
 }
 
 shell_init_suite bash --noprofile --norc
@@ -1002,6 +1014,90 @@ if command -v zsh >/dev/null 2>&1; then
     assert_equals "_wt" "$comps_wt" "zsh: shell-init after compinit binds wt directly"
 else
     echo "  (zsh not installed -- skipping zsh shell-init checks)"
+fi
+
+if command -v fish >/dev/null 2>&1; then
+    shell_init_suite fish
+    assert_contains "$(shell_init_probe fish 'complete -C"wt go pull-f"')" "pull-feature" \
+        "fish: shell-init registers completion"
+    assert_contains "$(shell_init_probe fish 'complete -C"wt shell-init "')" "fish" \
+        "fish: completion offers the shell-init shells"
+else
+    echo "  (fish not installed -- skipping fish shell-init checks)"
+fi
+
+# Without the function, go still prints only the path on stdout, and the
+# hint stays off stderr unless stdout is a terminal -- cd "$(wt go x)" in a
+# script must not start talking.
+output=$(cd "$TMP/pullproj" && "$WT" go pull-feature 2>&1)
+assert_equals "$feature" "$output" "go through a pipe prints the path and nothing else"
+assert_contains "$(cd "$TMP/pullproj" && "$WT" doctor 2>&1)" "shell integration not loaded" \
+    "doctor notes a missing shell function"
+(cd "$TMP/pullproj" && "$WT" doctor >/dev/null 2>&1)
+assert_equals 0 $? "a missing shell function never fails doctor"
+
+# A pty is the only way to give go a terminal on stdout; util-linux script
+# provides one, and BSD script takes different arguments. script runs its
+# command through $SHELL, so the shell under test is set inside the pty.
+if script --version 2>/dev/null | grep -q util-linux; then
+    hint_probe() {
+        (cd "$TMP/pullproj" && SHELL=/bin/sh \
+            script -qec "SHELL='$1' WT_SHELL_INTEGRATION='$2' '$WT' go pull-feature" /dev/null 2>&1)
+    }
+    output=$(hint_probe /bin/zsh "")
+    assert_contains "$output" "$feature" "go at a terminal still prints the path"
+    # shellcheck disable=SC2016  # the literal line the user is told to paste
+    assert_contains "$output" 'eval "$(wt shell-init zsh)"' "go at a terminal names the zsh line to add"
+    assert_contains "$(hint_probe /usr/bin/fish "")" "wt shell-init fish | source" \
+        "go at a terminal names the fish line to add"
+    assert_contains "$(hint_probe /bin/tcsh "")" "shell-init --help" \
+        "go at a terminal points an unsupported shell at the help"
+    assert_not_contains "$(hint_probe /bin/zsh 1)" "shell-init" \
+        "go called by the shell function stays quiet"
+else
+    echo "  (util-linux script not available -- skipping terminal hint checks)"
+fi
+
+# ============================================================
+# Test Suite: install.sh
+# ============================================================
+test_suite "install.sh"
+
+install_probe() {
+    SHELL="$1" PREFIX="$2" bash "$ROOT/install.sh" 2>&1
+}
+
+output=$(install_probe /bin/zsh "$TMP/prefix")
+assert_equals 0 $? "install.sh succeeds into an empty PREFIX"
+# shellcheck disable=SC2016  # the literal line the user is told to paste
+assert_contains "$output" 'eval "$(wt shell-init zsh)"' "install.sh prints the zsh line"
+assert_symlink "$TMP/prefix/share/fish/vendor_functions.d/wt.fish" "$ROOT/functions/wt.fish" \
+    "install.sh links the fish function"
+assert_symlink "$TMP/prefix/share/fish/vendor_completions.d/wt.fish" "$ROOT/completions/wt.fish" \
+    "install.sh links the fish completion"
+# shellcheck disable=SC2016  # the literal line the user is told to paste
+assert_contains "$(install_probe /bin/bash "$TMP/prefix")" 'eval "$(wt shell-init bash)"' \
+    "install.sh prints the bash line"
+assert_contains "$(install_probe /usr/bin/fish "$TMP/prefix")" "wt shell-init fish | source" \
+    "install.sh prints the fish line when PREFIX is outside fish's data dir"
+output=$(install_probe /usr/bin/fish "$HOME/.local")
+assert_contains "$output" "on its own" "install.sh tells a default-PREFIX fish user nothing is left to do"
+assert_not_contains "$output" "bashrc" "install.sh never points a fish user at ~/.bashrc"
+assert_not_contains "$(install_probe /bin/tcsh "$TMP/prefix")" "bashrc" \
+    "install.sh never points an unsupported shell at ~/.bashrc"
+
+# The vendor dirs are on fish's default search paths, so a default-PREFIX
+# install needs no config.fish line at all.
+if command -v fish >/dev/null 2>&1; then
+    output=$(PATH="$HOME/.local/bin:$PATH" fish -c '
+        cd "'"$TMP"'/pullproj"; or exit 1
+        wt go pull-feature
+        pwd -P
+        complete -C"wt shell-init "' 2>/dev/null)
+    assert_contains "$output" "$feature" "fish autoloads the function from the vendor dir"
+    assert_contains "$output" "zsh" "fish autoloads the completion from the vendor dir"
+else
+    echo "  (fish not installed -- skipping fish vendor dir checks)"
 fi
 
 # ============================================================

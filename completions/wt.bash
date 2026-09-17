@@ -105,7 +105,7 @@ _wt() {
                 fi ;;
             shell-init)
                 [[ "$COMP_CWORD" -eq 2 ]] || return 0
-                candidates="bash zsh" ;;
+                candidates="bash zsh fish" ;;
             doctor|version)
                 candidates="--json" ;;
             convert)

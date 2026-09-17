@@ -26,11 +26,12 @@ jobs:
       - name: install flock
         if: runner.os == 'macOS'
         run: brew install flock
-      # The zsh completion and shell-init checks skip themselves without
-      # zsh; macOS ships it, the Ubuntu image does not.
-      - name: install zsh
+      # The zsh and fish checks skip themselves without the shell. The
+      # Ubuntu image ships neither; macOS ships zsh, and fish is covered by
+      # the Linux leg.
+      - name: install zsh and fish
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
       - name: test suite
         run: bash tests/test-wt.sh
       # macOS ships bash 3.2 at /bin/bash, which is wt's declared floor;
