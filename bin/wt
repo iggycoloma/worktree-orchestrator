@@ -2347,20 +2347,27 @@ doctor_local_probes() {
 }
 
 # The same probe shape share_build_caches uses: a directory pattern only
-# matches when the probe carries the trailing slash itself.
+# matches when the probe carries the trailing slash itself. Except where
+# CACHE_MODE=link has already put a symlink at the destination: git rejects
+# a trailing-slash pathspec through a symlink ("beyond a symbolic link")
+# before it consults any ignore rule, and that failure read as unignored on
+# exactly the worktrees where sharing had worked. The bare path is what git
+# would be asked to ignore there, so it is the probe.
 #
 # Entries with no source in the stable checkout are left out, because that is
 # where share_build_caches gives up too -- probing them anyway reports a path
 # as unignored that nothing would ever have tried to share. They are covered
 # by the absent-source note instead.
 doctor_cache_probes() {
-    local conf="$1" stable="$2" paths entry out=""
+    local conf="$1" stable="$2" worktree="$3" paths entry out=""
     paths="$(read_conf "$conf" CACHE_PATHS "")"
     [[ -n "$paths" ]] || return 0
     while IFS= read -r entry; do
         [[ -n "$entry" ]] || continue
         [[ -e "$stable/$entry" ]] || continue
-        [[ ! -d "$stable/$entry" ]] || entry="$entry/"
+        if [[ -d "$stable/$entry" && ! -L "$worktree/$entry" ]]; then
+            entry="$entry/"
+        fi
         out="$out$entry"$'\n'
     done < <(printf '%s\n' "$paths" | tr ',' '\n')
     printf '%s' "$out"
@@ -2391,7 +2398,7 @@ doctor_check_coverage() {
     while IFS= read -r rel; do
         [[ -n "$rel" ]] || continue
         d_fail "$label: CACHE_PATHS names '$rel', which this branch does not gitignore; add and sync both refuse it"
-    done < <(doctor_unignored "$worktree" "$(doctor_cache_probes "$conf" "$stable")")
+    done < <(doctor_unignored "$worktree" "$(doctor_cache_probes "$conf" "$stable" "$worktree")")
 
     # A note, never a failure: on a checkout where nobody has installed
     # dependencies yet, every cache path is legitimately absent.

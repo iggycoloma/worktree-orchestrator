@@ -1798,6 +1798,36 @@ printf 'node_modules/\n' >> main/.gitignore
 assert_not_contains "$("$WT" doctor 2>&1)" "CACHE_PATHS names" \
     "ignoring the cache path clears the finding"
 
+# CACHE_MODE=link leaves a symlink at the destination, and git refuses a
+# trailing-slash pathspec through a symlink ("beyond a symbolic link"), so a
+# probe shaped for a not-yet-existing directory read every shared cache as
+# unignored -- on exactly the worktrees where sharing had worked. A dir-only
+# pattern ("node_modules/") never matches a symlink, so the ignore rule here
+# is the bare name. The conf is tracked, so it has to reach origin before
+# add checks it out.
+printf '.env\n.env.*\nnode_modules\n' > main/.gitignore
+printf 'CACHE_PATHS=node_modules\nCACHE_MODE=link\n' > main/.worktree.conf
+git -C main add -A >/dev/null 2>&1
+git -C main commit -q -m "chore: link caches" >/dev/null 2>&1
+git -C main push -q origin HEAD >/dev/null 2>&1
+"$WT" add linked >/dev/null 2>&1
+assert_is_symlink "$TMP/p3/wt/linked/node_modules" "add links the cache under CACHE_MODE=link"
+output=$("$WT" doctor 2>&1)
+assert_equals 0 $? "a linked cache path passes doctor"
+assert_not_contains "$output" "CACHE_PATHS names" \
+    "a symlinked cache destination is not reported as unignored"
+
+# The bare probe still has to ask git the real question: drop the rule on
+# the task branch and the linked cache is a finding again, named as the
+# path git would be asked to ignore.
+printf '.env\n.env.*\n' > "$TMP/p3/wt/linked/.gitignore"
+output=$("$WT" doctor 2>&1)
+assert_not_equals 0 $? "an unignored symlinked cache path fails doctor"
+assert_contains "$output" "linked: CACHE_PATHS names 'node_modules'" \
+    "a symlinked cache destination the branch stopped ignoring is reported"
+git -C "$TMP/p3/wt/linked" checkout -q -- .gitignore
+"$WT" remove linked >/dev/null 2>&1
+
 printf 'secret\n' > local/shared/notignored.txt
 output=$("$WT" doctor 2>&1)
 assert_contains "$output" "local/ provisions 'notignored.txt'" \
