@@ -316,6 +316,10 @@ cd "$TMP/proj" || exit 1
 dest=$("$WT" add issue-123 2>/dev/null)
 assert_equals "$TMP/proj/wt/issue-123" "$dest" "orchestration worktrees land in wt/"
 assert_rel_pointer "$dest/.git" "orchestration pointer is relative into repo.git"
+# Tracking origin/main would make `git pull` merge main in and `git push`
+# refuse under push.default=simple.
+assert_equals "" "$(git --git-dir="$TMP/proj/repo.git" config --get branch.issue-123.merge)" \
+    "a new branch does not track its base"
 
 # Attaching to a branch the bare clone brought along must adopt
 # origin/<branch>, for the same "no tracking information" reason as main/.
@@ -634,6 +638,17 @@ assert_not_equals 0 $? "doctor fails when origin has no fetch refspec"
 assert_contains "$output" "no fetch refspec" "doctor names the missing refspec"
 assert_contains "$output" "config remote.origin.fetch" "doctor prints the repair command"
 git --git-dir="$TMP/proj/repo.git" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+
+# A branch made by an older add still tracks origin/main; doctor must flag it
+# and print the repair, and the repair must clear it.
+git -C "$TMP/proj/wt/from-inside" branch --quiet --set-upstream-to=origin/main
+output=$("$WT" doctor 2>&1)
+assert_not_equals 0 $? "doctor fails when a worktree branch tracks a differently named branch"
+assert_contains "$output" "branch from-inside tracks origin/main" "doctor names the mismatched upstream"
+assert_contains "$output" "branch --unset-upstream" "doctor prints the upstream repair"
+git -C "$TMP/proj/wt/from-inside" branch --unset-upstream
+"$WT" doctor >/dev/null 2>&1
+assert_equals 0 $? "doctor passes once the stray upstream is unset"
 
 # ============================================================
 # Test Suite: ignore generation
@@ -1851,6 +1866,76 @@ assert_contains "$output" "no runtime identity and no port block" \
     "doctor explains what the missing ignore rule costs"
 
 cd "$TMP" || exit 1
+
+# ============================================================
+# Test Suite: step timings
+# ============================================================
+test_suite "timings"
+
+fmt_probe() {
+    bash -c "source '$WT'; wt_now_ms() { WT_NOW_MS=$1; }; wt_elapsed_since 0; printf '%s' \"\$WT_DURATION\""
+}
+assert_equals "0.0s" "$(fmt_probe 40)" "durations under 100ms round down to 0.0s"
+assert_equals "1.2s" "$(fmt_probe 1234)" "durations under a minute show tenths"
+assert_equals "1m15s" "$(fmt_probe 75300)" "durations past a minute show minutes and seconds"
+
+make_remote "$TMP/remote-timing.git"
+"$WT" init "$TMP/remote-timing.git" "$TMP/timing" >/dev/null 2>&1
+cd "$TMP/timing" || exit 1
+printf '#!/usr/bin/env bash\nexit 0\n' > local/hooks/post-add
+chmod +x local/hooks/post-add
+
+err=$("$WT" add timed-one 2>&1 >/dev/null)
+assert_contains "$err" "[+" "log lines carry the elapsed time"
+assert_contains "$err" "fetching origin..." "a step is announced before it runs"
+assert_contains "$err" "fetching origin done in " "a step reports its duration after it runs"
+assert_contains "$err" "running post-add hook ($TMP/timing/local/hooks/post-add) done in " "hooks are timed and named by path"
+assert_contains "$err" "add finished in " "the command reports its total"
+
+out=$("$WT" add timed-two 2>/dev/null)
+assert_equals "$TMP/timing/wt/timed-two" "$out" "timing output never reaches stdout"
+
+err=$("$WT" add timed-one 2>&1 >/dev/null)
+assert_contains "$err" "add failed after " "a failed command reports how long it ran"
+
+err=$(WT_TIMINGS=0 "$WT" add timed-three 2>&1 >/dev/null)
+assert_contains "$err" "fetching origin..." "WT_TIMINGS=0 keeps the step announcements"
+assert_not_contains "$err" "[+" "WT_TIMINGS=0 drops the elapsed prefix"
+assert_not_contains "$err" "done in" "WT_TIMINGS=0 drops step durations"
+assert_not_contains "$err" "finished in" "WT_TIMINGS=0 drops the total"
+
+assert_not_contains "$("$WT" list 2>&1)" "[+" "read-only commands are not timed"
+
+# Releasing the port lock once closed stderr for the rest of the run, hiding
+# everything remove logged after it, post-remove hook output included.
+printf '#!/usr/bin/env bash\necho post-remove-ran >&2\n' > local/hooks/post-remove
+chmod +x local/hooks/post-remove
+err=$("$WT" remove timed-two 2>&1 >/dev/null)
+assert_contains "$err" "post-remove-ran" "post-remove hook output survives the port release"
+assert_contains "$err" "removed $TMP/timing/wt/timed-two" "remove still logs after releasing the port lock"
+assert_contains "$err" "remove finished in " "remove reports its total"
+rm -f local/hooks/post-remove
+
+# macOS /bin/bash is 3.2, which has no EPOCHREALTIME and falls back to SECONDS.
+if [[ -x /bin/bash ]] && ! /bin/bash -c '[[ -n "${EPOCHREALTIME:-}" ]]'; then
+    err=$(/bin/bash "$WT" add timed-legacy 2>&1 >/dev/null)
+    assert_contains "$err" "add finished in " "timings work without EPOCHREALTIME"
+fi
+
+cd "$TMP" || exit 1
+
+out=$("$WT" -C "$TMP/timing" add from-elsewhere 2>/dev/null)
+assert_equals "$TMP/timing/wt/from-elsewhere" "$out" "-C resolves the project from the given directory"
+assert_contains "$("$WT" -C "$TMP/timing" list 2>&1)" "$TMP/timing/wt/from-elsewhere" "-C applies to every command"
+err=$("$WT" -C "$TMP/no-such-dir" list 2>&1)
+assert_contains "$err" "-C: cannot change into $TMP/no-such-dir" "-C names a directory it cannot enter"
+assert_contains "$("$WT" -C 2>&1)" "Usage:" "-C without a directory is a usage error"
+out=$(cd / && CDPATH="$TMP" "$WT" -C timing path from-elsewhere 2>/dev/null)
+assert_equals "$TMP/timing/wt/from-elsewhere" "$out" "-C keeps a CDPATH-resolved directory out of stdout"
+
+mkdir -p "$TMP/not-a-repo"
+err=$(cd "$TMP/not-a-repo" && "$WT" list 2>&1)
+assert_contains "$err" "not inside a git repository or orchestration directory" "outside a repository wt explains instead of exiting silently"
 
 # ============================================================
 # Summary

@@ -30,8 +30,96 @@ fi
 # a hostile argv0 rewrite the notes rather than just name the command.
 case "$WT_NAME" in ''|*[!A-Za-z0-9._-]*) WT_NAME='wt' ;; esac
 
-log()  { printf '%s: %s\n' "$WT_NAME" "$*" >&2; }
+log()  {
+    if [[ -n "$WT_TIMING_T0" ]]; then
+        wt_elapsed_since "$WT_TIMING_T0"
+        printf '%s: [+%s] %s\n' "$WT_NAME" "$WT_DURATION" "$*" >&2
+    else
+        printf '%s: %s\n' "$WT_NAME" "$*" >&2
+    fi
+}
 die()  { printf '%s: error: %s\n' "$WT_NAME" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- timing ----
+
+# Set by timing_start for the commands that do slow work, so their log lines
+# say when they happened. Empty means no prefix and no duration lines.
+WT_TIMING_T0=""
+
+# Results go through globals rather than stdout because these run on every
+# log line, and $(...) would fork for each one. EPOCHREALTIME needs bash 5;
+# macOS /bin/bash is 3.2, where whole seconds are all a fork-free clock gives.
+wt_now_ms() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        local t="${EPOCHREALTIME/,/.}"
+        local frac="${t#*.}000"
+        WT_NOW_MS=$(( ${t%.*} * 1000 + 10#${frac:0:3} ))
+    else
+        WT_NOW_MS=$(( SECONDS * 1000 ))
+    fi
+}
+
+wt_elapsed_since() {
+    local ms
+    wt_now_ms
+    ms=$(( WT_NOW_MS - $1 ))
+    if (( ms < 60000 )); then
+        printf -v WT_DURATION '%d.%ds' $(( ms / 1000 )) $(( ms % 1000 / 100 ))
+    else
+        printf -v WT_DURATION '%dm%02ds' $(( ms / 60000 )) $(( ms % 60000 / 1000 ))
+    fi
+}
+
+timing_start() {
+    [[ "${WT_TIMINGS:-1}" != "0" ]] || return 0
+    WT_TIMING_COMMAND="$1"
+    wt_now_ms
+    WT_TIMING_T0="$WT_NOW_MS"
+    trap 'timing_finish $?' EXIT
+}
+
+timing_finish() {
+    local status="$1" t0="$WT_TIMING_T0"
+    WT_TIMING_T0=""
+    wt_elapsed_since "$t0"
+    if [[ "$status" -eq 0 ]]; then
+        log "$WT_TIMING_COMMAND finished in $WT_DURATION"
+    else
+        log "$WT_TIMING_COMMAND failed after $WT_DURATION (exit $status)"
+    fi
+}
+
+# Announces a step before it starts, so a long pause is attributable to
+# something, and reports its duration after. Returns the step's own status.
+# Errexit is suspended inside the step, as it is for any function run as a
+# condition; the steps wrapped here already return their failures explicitly.
+timed() {
+    local label="$1" t0 rc=0
+    shift
+    log "$label..."
+    wt_now_ms
+    t0="$WT_NOW_MS"
+    "$@" || rc=$?
+    if [[ -n "$WT_TIMING_T0" ]]; then
+        wt_elapsed_since "$t0"
+        if [[ "$rc" -eq 0 ]]; then
+            log "$label done in $WT_DURATION"
+        else
+            log "$label failed after $WT_DURATION"
+        fi
+    fi
+    return "$rc"
+}
+
+in_dir() {
+    local dir="$1"
+    shift
+    (cd "$dir" && "$@")
+}
+
+# For a timed step whose own output is noise: redirecting the timed call
+# itself would swallow its progress lines too.
+quietly() { "$@" >/dev/null 2>&1; }
 
 # Escapes what actually turns up in this tool's JSON -- paths, branch names,
 # and log lines. jq would be a better escaper but is not a dependency here,
@@ -145,6 +233,8 @@ NOTE
   <name> doubles as the branch name when it is a legal ref (e.g. user/CLK-943);
   otherwise the branch is the slugified name. [base] defaults to origin's
   default branch, and is used only when the branch does not already exist.
+  A new branch gets no upstream until its first 'git push -u' (or with
+  push.autoSetupRemote, its first push), so it never tracks [base].
 
   pr:123 and mr:123 are synonyms: both resolve the request's source branch
   through gh or glab, whichever the origin remote calls for, and base the new
@@ -252,9 +342,10 @@ NOTE
 
   Fetches origin (--prune), then fast-forwards the branch to its own
   origin/<branch> -- not to whatever upstream the branch was configured with,
-  which for a fresh worktree is the default branch and would be the wrong
-  thing to merge in. Refuses staged or unstaged changes, and never merges or
-  rebases: a diverged tree is an error to resolve explicitly.
+  which for a branch created by an older @WT@ add is the default branch and
+  would be the wrong thing to merge in. Refuses staged or unstaged changes,
+  and never merges or rebases: a diverged tree is an error to resolve
+  explicitly.
 
   A branch with no origin/<branch> yet has nothing to pull. Named, that is an
   error -- it is what a task worktree looks like until it is pushed, and
@@ -317,11 +408,15 @@ emit() {
 usage() {
     local status="${1:-2}" cmd spec
     emit "$status" "$(
-        printf 'Usage: %s <command> [args]\n\n' "$WT_NAME"
+        printf 'Usage: %s [-C <dir>] <command> [args]\n\n' "$WT_NAME"
         for cmd in "${WT_COMMANDS[@]}"; do
             spec="$(command_spec "$cmd")"
             printf '  %-28s%s\n' "${spec%%$'\t'*}" "${spec#*$'\t'}"
         done
+        printf '\ninit, convert, add, pull, sync, remove and container up time each slow\n'
+        printf 'step on stderr ([+elapsed] prefixes, per-step durations, a total);\n'
+        printf 'WT_TIMINGS=0 turns that off.\n'
+        printf '\n-C <dir> runs as if started in <dir>, like git -C.\n'
         printf "\nRun '%s <command> --help' for detail on one command." "$WT_NAME"
     )"
 }
@@ -376,7 +471,9 @@ find_orchestration_root() {
 
 # In clone mode: print the main worktree root of the enclosing repository.
 find_clone_root() {
-    git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p'
+    # Outside any repository git exits 128, and under pipefail that would end
+    # the script silently instead of reaching detect_mode's explanatory die.
+    { git worktree list --porcelain 2>/dev/null || true; } | sed -n '1s/^worktree //p'
 }
 
 # Sets globals: WT_MODE, WT_GIT_DIR, WT_ROOT (orchestration dir or clone parent).
@@ -646,7 +743,7 @@ share_build_caches() {
         mkdir -p "$(dirname "$dst")" || return 1
         case "$mode" in
             link) ln -sfn "$src" "$dst" || return 1; log "linked cache $entry" ;;
-            *)    cp -a "$src" "$dst" || return 1; log "copied cache $entry" ;;
+            *)    timed "copying cache $entry" cp -a "$src" "$dst" || return 1 ;;
         esac
     done < <(printf '%s\n' "$paths" | tr ',' '\n')
     return 0
@@ -700,8 +797,7 @@ run_hook() {
     fi
 
     [[ -x "$hook" ]] || return 0
-    log "running $name hook: $hook"
-    if (cd "$cwd" && "$hook" "$worktree"); then
+    if timed "running $name hook ($hook)" in_dir "$cwd" "$hook" "$worktree"; then
         return 0
     fi
     case "$name" in
@@ -774,7 +870,10 @@ acquire_ports_lock() {
 }
 
 release_ports_lock() {
-    exec 9>&- 2>/dev/null || true
+    # Not `exec 9>&- 2>/dev/null`: with no command, exec applies every
+    # redirection to the shell itself and would discard stderr for the rest
+    # of the run.
+    exec 9>&-
 }
 
 # A registry hit only proves no other worktree claimed the port. It says
@@ -1093,7 +1192,7 @@ cmd_container_up() {
     repo="$(dotfiles_repo)"
     [[ -n "$repo" ]] && flags+=(--dotfiles-repository "$repo")
 
-    devcontainer up "${flags[@]}"
+    timed "starting the dev container" devcontainer up "${flags[@]}"
 }
 
 cmd_container_exec() {
@@ -1150,9 +1249,9 @@ teardown_containers() {
     [[ ! -f /.dockerenv ]] || return 0
     ids="$(docker ps -aq --filter "label=wt.project=$(project_id)" --filter "label=wt.slug=$slug" 2>/dev/null || true)"
     if [[ -n "$ids" ]]; then
-        log "removing containers for $slug"
         # shellcheck disable=SC2086  # ids are newline-separated container ids
-        docker rm -f $ids >/dev/null 2>&1 || log "warning: container teardown failed for $slug"
+        timed "removing containers for $slug" quietly docker rm -f $ids \
+            || log "warning: container teardown failed for $slug"
     fi
 }
 
@@ -1170,7 +1269,7 @@ cmd_init() {
     # Transactional: a failed clone or main checkout removes repo.git so a
     # re-run does not hit "already initialized" on a half-built dir. The
     # scaffolding dirs stay -- they may already hold user-seeded local/.
-    if ! git clone --bare "$url" "$root/repo.git"; then
+    if ! timed "cloning $url" git clone --bare "$url" "$root/repo.git"; then
         rm -rf "$root/repo.git"
         die "clone failed; nothing initialized at $root"
     fi
@@ -1183,7 +1282,7 @@ cmd_init() {
     local default_branch
     default_branch="$(git --git-dir="$root/repo.git" symbolic-ref --short HEAD 2>/dev/null || true)"
     default_branch="${default_branch:-main}"
-    git --git-dir="$root/repo.git" fetch --quiet origin \
+    timed "fetching origin" git --git-dir="$root/repo.git" fetch --quiet origin \
         || log "warning: initial fetch failed; refs/remotes/origin/* will populate on the next 'git fetch origin'"
     if git --git-dir="$root/repo.git" rev-parse --verify --quiet "refs/remotes/origin/$default_branch" >/dev/null; then
         git --git-dir="$root/repo.git" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default_branch"
@@ -1195,7 +1294,8 @@ cmd_init() {
     fi
     ensure_rel_flag
     # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
-    if ! git --git-dir="$root/repo.git" worktree add $WT_REL_FLAG "$root/main" "$default_branch" >&2; then
+    if ! timed "checking out $default_branch into main/" \
+        git --git-dir="$root/repo.git" worktree add $WT_REL_FLAG "$root/main" "$default_branch" >&2; then
         rm -rf "$root/repo.git" "$root/main"
         die "could not check out '$default_branch' (empty remote?); rolled back -- push an initial commit and re-run"
     fi
@@ -1341,7 +1441,8 @@ cmd_convert() {
 
     ensure_rel_flag
     # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
-    if ! git --git-dir="$root/repo.git" worktree add $WT_REL_FLAG "$root/main" "$default_branch" >&2; then
+    if ! timed "checking out $default_branch into main/" \
+        git --git-dir="$root/repo.git" worktree add $WT_REL_FLAG "$root/main" "$default_branch" >&2; then
         convert_rollback "$root" "$stage"
         die "could not check out '$default_branch' into main/; conversion rolled back"
     fi
@@ -1510,7 +1611,8 @@ cmd_add() {
             # always exists on the upstream repository, is immutable, and
             # names the exact revision under review. The local branch is
             # pr-N/mr-N so it cannot collide with a contributor's branch name.
-            git --git-dir="$WT_GIT_DIR" fetch --quiet origin "+$remote_ref:refs/remotes/origin/$name" \
+            timed "fetching $forge request $req_num" \
+                git --git-dir="$WT_GIT_DIR" fetch --quiet origin "+$remote_ref:refs/remotes/origin/$name" \
                 || die "cannot fetch $remote_ref from origin (no such request on $forge?)"
             base="origin/$name"
             is_request=1
@@ -1534,7 +1636,7 @@ cmd_add() {
             ;;
     esac
 
-    local dest branch hook_status=0 created_branch=0 track_flag=""
+    local dest branch hook_status=0 created_branch=0
     # The name doubles as the branch when it is a legal ref (slashes fine,
     # e.g. user/CLK-943); otherwise the branch falls back to the slug.
     if git check-ref-format --branch "$name" >/dev/null 2>&1; then
@@ -1553,11 +1655,10 @@ cmd_add() {
     ensure_rel_flag
     if git --git-dir="$WT_GIT_DIR" show-ref --verify --quiet "refs/heads/$branch"; then
         # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
-        git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG "$dest" "$branch" >&2
-        # Branches inherited from the bare clone have no upstream (the
-        # new-branch arm below gets one from git's own autoSetupMerge when
-        # the base is a remote-tracking ref). Adopt origin/<branch> when it
-        # exists and nothing is configured, so plain `git pull` works.
+        timed "checking out $branch" git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG "$dest" "$branch" >&2
+        # Branches inherited from the bare clone have no upstream. Adopt
+        # origin/<branch> when it exists and nothing is configured, so plain
+        # `git pull` works.
         # Skipped for a request: origin has no refs/heads/pr-N, so that
         # upstream would fail every pull with "no such ref was fetched".
         if [[ "$is_request" -eq 0 ]] \
@@ -1574,23 +1675,23 @@ cmd_add() {
         # outside refs/heads/*, so --prune here would delete it as stale
         # against the configured refspec before worktree add can use it.
         if [[ "$is_request" -eq 0 ]] && git --git-dir="$WT_GIT_DIR" config remote.origin.url >/dev/null 2>&1; then
-            git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin 2>/dev/null \
+            timed "fetching origin" quietly git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin \
                 || log "warning: fetch failed; basing '$branch' on last-known origin state"
         fi
         [[ -n "$base" ]] || base="$(default_base "$WT_GIT_DIR")"
-        # git's autoSetupMerge points the new branch at its base when that
-        # base is a remote-tracking ref. For origin/<default> that is what a
-        # plain `git pull` wants; for a request it configures an upstream
-        # origin cannot serve (it has no refs/heads/pr-N, and any
-        # `fetch --prune` deletes the request ref), so suppress it there.
-        [[ "$is_request" -eq 0 ]] || track_flag="--no-track"
-        # shellcheck disable=SC2086  # WT_REL_FLAG and track_flag are deliberately word-split
-        git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG $track_flag -b "$branch" "$dest" "$base" >&2
+        # Without --no-track, git's default autoSetupMerge makes a branch cut
+        # from origin/<default> track it: `git pull` then merges the default
+        # branch in, status counts against it, and `git push` refuses under
+        # push.default=simple because the names differ. The first
+        # `git push -u` (or push.autoSetupRemote) sets the real upstream.
+        # shellcheck disable=SC2086  # WT_REL_FLAG is deliberately word-split
+        timed "checking out new branch $branch from $base" \
+            git --git-dir="$WT_GIT_DIR" worktree add $WT_REL_FLAG --no-track -b "$branch" "$dest" "$base" >&2
         created_branch=1
     fi
 
     if [[ "$WT_MODE" == "orchestration" ]]; then
-        if ! provision_local_files "$WT_ROOT" "$dest"; then
+        if ! timed "provisioning local/" provision_local_files "$WT_ROOT" "$dest"; then
             # Roll back: a half-provisioned worktree must not survive a
             # failed security validation.
             rollback_add "$dest" "$branch" "$created_branch"
@@ -1600,7 +1701,7 @@ cmd_add() {
             rollback_add "$dest" "$branch" "$created_branch"
             die "cache sharing failed; worktree rolled back"
         fi
-        if ! write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")"; then
+        if ! timed "assigning a port block" write_worktree_env "$WT_ROOT" "$dest" "$(basename "$dest")"; then
             rollback_add "$dest" "$branch" "$created_branch"
             die "could not assign a port block; worktree rolled back"
         fi
@@ -1706,7 +1807,7 @@ pull_one() {
         log "no origin/$branch to pull (branch never pushed?)"
         return 2
     fi
-    git -C "$dest" merge --ff-only "origin/$branch" >&2 \
+    timed "fast-forwarding $branch" git -C "$dest" merge --ff-only "origin/$branch" >&2 \
         || { log "cannot fast-forward: $dest has commits not on origin/$branch"; return 1; }
     log "pulled $dest ($branch -> origin/$branch)"
 }
@@ -1727,7 +1828,7 @@ cmd_pull() {
     if [[ "$all" -eq 1 ]]; then
         # One fetch for the whole sweep: every per-tree merge reads only
         # refs/remotes/origin/*, so N fetches would buy nothing but latency.
-        git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin || die "fetch failed"
+        timed "fetching origin" git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin || die "fetch failed"
         local wt_path failures=0 pulled=0 skipped=0
         while IFS= read -r wt_path; do
             [[ -d "$wt_path" ]] || continue
@@ -1750,7 +1851,7 @@ cmd_pull() {
     local dest
     dest="$(resolve_or_current "$name")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
-    git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin || die "fetch failed"
+    timed "fetching origin" git --git-dir="$WT_GIT_DIR" fetch --prune --quiet origin || die "fetch failed"
     pull_one "$dest" || exit 1
     # New commits can invalidate installed dependencies and generated files,
     # so this is the natural place to reinstall or regenerate them.
@@ -1842,7 +1943,7 @@ cmd_sync() {
                 failures=$((failures + 1))
                 continue
             fi
-            if provision_local_files "$WT_ROOT" "$wt_path"; then
+            if timed "provisioning local/ into $wt_path" provision_local_files "$WT_ROOT" "$wt_path"; then
                 log "synced local/ into $wt_path"
                 # After provisioning, because the conf that names the cache
                 # paths can itself arrive from local/ in this same pass.
@@ -1870,7 +1971,8 @@ cmd_sync() {
     dest="$(resolve_or_current "$name")"
     [[ -d "$dest" ]] || die "no such worktree: $dest"
     run_hook pre-sync "$WT_ROOT" "$dest" || die "pre-sync hook failed; nothing copied"
-    provision_local_files "$WT_ROOT" "$dest" || die "sync failed validation; nothing copied"
+    timed "provisioning local/" provision_local_files "$WT_ROOT" "$dest" \
+        || die "sync failed validation; nothing copied"
     log "synced local/ into $dest"
     share_build_caches "$WT_ROOT" "$dest" "$dest/$WT_CONF_REL" \
         || die "cache sharing failed for $dest"
@@ -1927,7 +2029,7 @@ cmd_remove() {
     # --force only bypasses git's own dirtiness refusal, which counts
     # ignored files (.env.worktree, provisioned .env.*). The checks above
     # already guarantee nothing but ignored files remains.
-    git --git-dir="$WT_GIT_DIR" worktree remove --force "$dest"
+    timed "deleting the checkout" git --git-dir="$WT_GIT_DIR" worktree remove --force "$dest"
     if [[ "$delete_branch" -eq 1 && -n "$branch" ]]; then
         git --git-dir="$WT_GIT_DIR" branch -D "$branch" >&2
     fi
@@ -2294,6 +2396,21 @@ doctor_check_hooks() {
     done
 }
 
+# Older `wt add` let git's autoSetupMerge point every new branch at its base,
+# so those branches still track origin/<default>: `git pull` merges the
+# default branch in and `git push` refuses under push.default=simple. Flags
+# any upstream whose branch name differs from the local one, the same rule
+# branch.autoSetupMerge=simple applies.
+doctor_check_upstream() {
+    local wt_path="$1" branch remote merge
+    branch="$(git -C "$wt_path" symbolic-ref --short -q HEAD 2>/dev/null)" || return 0
+    merge="$(git -C "$wt_path" config --get "branch.$branch.merge" 2>/dev/null)" || return 0
+    [[ "$merge" != "refs/heads/$branch" ]] || return 0
+    remote="$(git -C "$wt_path" config --get "branch.$branch.remote" 2>/dev/null || true)"
+    d_warn "branch $branch tracks ${remote:-?}/${merge#refs/heads/}, so 'git pull' merges that branch in and 'git push' is refused; fix: git -C '$wt_path' branch --unset-upstream (the next 'git push -u' sets the right one)"
+    return 1
+}
+
 # read_conf substitutes its default whenever a line does not match ^KEY= or
 # the value carries a character outside its allowed set, and says nothing
 # when it does. "The project set this key" and "the value was read" are
@@ -2476,6 +2593,7 @@ cmd_doctor() {
     while IFS= read -r wt_path; do
         if git -C "$wt_path" rev-parse --git-dir >/dev/null 2>&1; then
             d_ok "worktree ok: $wt_path"
+            doctor_check_upstream "$wt_path" || failures=$((failures + 1))
         else
             d_warn "worktree broken (try 'git worktree repair'): $wt_path"
             failures=$((failures + 1))
@@ -2585,6 +2703,17 @@ if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     return 0
 fi
 
+# Like git -C, for callers whose working directory does not persist between
+# commands (agent shells): every command resolves its project from the cwd,
+# and a leading cd would stop wt being the command's first token.
+if [[ "${1:-}" == "-C" ]]; then
+    [[ -n "${2:-}" ]] || usage 2
+    # cd prints the directory when CDPATH resolves it, which would land in
+    # the stdout that path and --json callers parse.
+    cd -- "$2" >/dev/null || die "-C: cannot change into $2"
+    shift 2
+fi
+
 command_name="${1:-}"
 [[ -n "$command_name" ]] || usage 2
 shift
@@ -2612,6 +2741,13 @@ else
         esac
     done
 fi
+
+# Only the commands that fetch, check out, copy, or run hooks: the quick
+# read-only ones would just gain noise, and go/path feed shell wrappers.
+case "$command_name" in
+    init|convert|add|pull|sync|remove) timing_start "$command_name" ;;
+    container) [[ "${1:-}" != "up" ]] || timing_start "container up" ;;
+esac
 
 case "$command_name" in
     init)         cmd_init "$@" ;;
