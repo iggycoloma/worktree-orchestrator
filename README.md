@@ -93,6 +93,22 @@ Commands that act on a worktree -- `pull`, `sync`, `container up`, `container ex
 Run `wt <command> --help` for detail on one command.
 Paths go to stdout and logging to stderr, so command substitution is safe: `cd "$(wt add feature-x)"`.
 
+`init`, `convert`, `add`, `pull`, `sync`, `remove` and `container up` announce each slow step (fetches, checkouts, provisioning, cache copies, hooks) before it starts and report its duration when it ends.
+Every log line carries the time since the command started, and the last line gives the total:
+
+```text
+wt: [+0.0s] fetching origin...
+wt: [+1.8s] fetching origin done in 1.8s
+wt: [+1.8s] checking out new branch iggy/CLK-1 from origin/main...
+wt: [+4.1s] checking out new branch iggy/CLK-1 from origin/main done in 2.3s
+wt: [+4.1s] running post-add hook (/src/proj/local/hooks/post-add)...
+wt: [+31.6s] running post-add hook (/src/proj/local/hooks/post-add) done in 27.5s
+wt: [+31.6s] add finished in 31.6s
+```
+
+Set `WT_TIMINGS=0` to drop the timestamps, durations, and total; the step announcements stay.
+Under macOS's stock bash 3.2 the clock has whole-second resolution; bash 5 gives tenths.
+
 ## Quickstart
 
 Clone mode, in any existing repository:
